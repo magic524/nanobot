@@ -33,6 +33,7 @@ build/
 *.spec
 pip-wheel-metadata/
 share/python-wheels/
+my_file/
 
 # Test & coverage
 .coverage
