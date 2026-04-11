@@ -59,6 +59,14 @@ class DreamConfig(Base):
         return f"every {hours}h"
 
 
+class SwitchProfileConfig(Base):
+    """Named runtime profile that can be activated with /switch."""
+
+    config: str
+    workspace: str | None = None
+    description: str | None = None
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -77,6 +85,10 @@ class AgentDefaults(Base):
     reasoning_effort: str | None = None  # low / medium / high / adaptive - enables LLM thinking mode
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
+    # 仅拦截“对当前聊天发送纯文本 message 工具回复”的误用。
+    # 这个开关适合本地模型（如 Ram/local）开启，避免把普通对话错误走成 message()。
+    block_same_chat_text_message_tool: bool = False
+    switch_profiles: dict[str, SwitchProfileConfig] = Field(default_factory=dict)
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
 

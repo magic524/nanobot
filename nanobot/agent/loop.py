@@ -147,6 +147,8 @@ class AgentLoop:
         timezone: str | None = None,
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
+        block_same_chat_text_message_tool: bool = False,
+        switch_profiles: dict[str, Any] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebToolsConfig
 
@@ -194,6 +196,10 @@ class AgentLoop:
             restrict_to_workspace=restrict_to_workspace,
         )
         self._unified_session = unified_session
+        # 仅对当前 profile 生效的 message() 误用拦截开关。
+        self._block_same_chat_text_message_tool = block_same_chat_text_message_tool
+        self.switch_profiles = switch_profiles or {}
+        self.active_profile_name: str | None = None
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stack: AsyncExitStack | None = None
@@ -226,6 +232,102 @@ class AgentLoop:
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
+    def list_switch_profiles(self) -> list[tuple[str, str | None]]:
+        """Return configured switchable profiles sorted by name."""
+        rows: list[tuple[str, str | None]] = []
+        for name in sorted(self.switch_profiles):
+            profile = self.switch_profiles[name]
+            desc = getattr(profile, "description", None)
+            rows.append((name, desc))
+        return rows
+
+    async def switch_profile(self, name: str) -> tuple[bool, str]:
+        """Hot-switch the active runtime profile."""
+        target_name = next((key for key in self.switch_profiles if key.lower() == name.lower()), None)
+        profile = self.switch_profiles.get(target_name) if target_name else None
+        if profile is None:
+            available = ", ".join(n for n, _ in self.list_switch_profiles()) or "(none)"
+            return False, f"Unknown profile `{name}`. Available: {available}"
+
+        from nanobot.config.loader import load_config, resolve_config_env_vars
+        from nanobot.nanobot import _make_provider
+
+        config_path = Path(profile.config).expanduser().resolve()
+        if not config_path.exists():
+            return False, f"Profile `{target_name}` config not found: {config_path}"
+
+        try:
+            loaded = resolve_config_env_vars(load_config(config_path))
+        except Exception as e:
+            return False, f"Failed to load profile `{target_name}`: {e}"
+
+        if profile.workspace:
+            loaded.agents.defaults.workspace = profile.workspace
+
+        try:
+            provider = _make_provider(loaded)
+        except Exception as e:
+            return False, f"Failed to initialize profile `{target_name}`: {e}"
+
+        # Apply the target config's runtime settings.
+        self.provider = provider
+        self.workspace = loaded.workspace_path
+        self.model = loaded.agents.defaults.model or provider.get_default_model()
+        self.max_iterations = loaded.agents.defaults.max_tool_iterations
+        self.context_window_tokens = loaded.agents.defaults.context_window_tokens
+        self.context_block_limit = loaded.agents.defaults.context_block_limit
+        self.max_tool_result_chars = loaded.agents.defaults.max_tool_result_chars
+        self.provider_retry_mode = loaded.agents.defaults.provider_retry_mode
+        self.web_config = loaded.tools.web
+        self.exec_config = loaded.tools.exec
+        self.restrict_to_workspace = loaded.tools.restrict_to_workspace
+        self._mcp_servers = loaded.tools.mcp_servers
+        self._unified_session = loaded.agents.defaults.unified_session
+        self._block_same_chat_text_message_tool = loaded.agents.defaults.block_same_chat_text_message_tool
+
+        self.context = ContextBuilder(self.workspace, timezone=loaded.agents.defaults.timezone)
+        self.sessions = SessionManager(self.workspace)
+        self.runner = AgentRunner(provider)
+        self.subagents = SubagentManager(
+            provider=provider,
+            workspace=self.workspace,
+            bus=self.bus,
+            model=self.model,
+            web_config=self.web_config,
+            max_tool_result_chars=self.max_tool_result_chars,
+            exec_config=self.exec_config,
+            restrict_to_workspace=self.restrict_to_workspace,
+        )
+        self.tools = ToolRegistry()
+        self._register_default_tools()
+        self.consolidator = Consolidator(
+            store=self.context.memory,
+            provider=provider,
+            model=self.model,
+            sessions=self.sessions,
+            context_window_tokens=self.context_window_tokens,
+            build_messages=self.context.build_messages,
+            get_tool_definitions=self.tools.get_definitions,
+            max_completion_tokens=provider.generation.max_tokens,
+        )
+        self.dream = Dream(
+            store=self.context.memory,
+            provider=provider,
+            model=self.model,
+            max_batch_size=loaded.agents.defaults.dream.max_batch_size,
+            max_iterations=loaded.agents.defaults.dream.max_iterations,
+            max_tool_result_chars=self.max_tool_result_chars,
+        )
+        if loaded.agents.defaults.dream.model_override:
+            self.dream.model = loaded.agents.defaults.dream.model_override
+        self.active_profile_name = target_name
+        self._last_usage = {}
+        return True, (
+            f"Switched to `{target_name}`.\n"
+            f"- Model: `{self.model}`\n"
+            f"- Workspace: `{self.workspace}`"
+        )
+
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self.workspace if (self.restrict_to_workspace or self.exec_config.sandbox) else None
@@ -246,7 +348,10 @@ class AgentLoop:
         if self.web_config.enable:
             self.tools.register(WebSearchTool(config=self.web_config.search, proxy=self.web_config.proxy))
             self.tools.register(WebFetchTool(proxy=self.web_config.proxy))
-        self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
+        self.tools.register(MessageTool(
+            send_callback=self.bus.publish_outbound,
+            block_same_chat_text_reply=self._block_same_chat_text_message_tool,
+        ))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(

@@ -135,6 +135,59 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_switch(ctx: CommandContext) -> OutboundMessage:
+    """Switch the active runtime profile."""
+    loop = ctx.loop
+    args = ctx.args.strip()
+
+    profiles = loop.list_switch_profiles() if hasattr(loop, "list_switch_profiles") else []
+    if not args:
+        lines = ["## Switch Profile", ""]
+        current = getattr(loop, "active_profile_name", None) or "(default)"
+        lines.append(f"- Current: `{current}`")
+        if not profiles:
+            lines.extend([
+                "- Available: none",
+                "",
+                "Configure `agents.defaults.switchProfiles` in your config to enable `/switch <name>`.",
+            ])
+        else:
+            lines.append("- Available:")
+            for name, desc in profiles:
+                suffix = f" — {desc}" if desc else ""
+                lines.append(f"  - `{name}`{suffix}")
+            lines.extend([
+                "",
+                "Usage: `/switch <name>`",
+            ])
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="\n".join(lines),
+            metadata={"render_as": "text"},
+        )
+
+    ok, content = await loop.switch_profile(args)
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        metadata={"render_as": "text"},
+    )
+
+
+async def cmd_switch_ram(ctx: CommandContext) -> OutboundMessage:
+    """Shortcut for switching to Ram."""
+    ctx.args = "Ram"
+    return await cmd_switch(ctx)
+
+
+async def cmd_switch_rem(ctx: CommandContext) -> OutboundMessage:
+    """Shortcut for switching to Rem."""
+    ctx.args = "Rem"
+    return await cmd_switch(ctx)
+
+
 def _extract_changed_files(diff: str) -> list[str]:
     """Extract changed file paths from a unified diff."""
     files: list[str] = []
@@ -321,6 +374,9 @@ def build_help_text() -> str:
         "/stop — Stop the current task",
         "/restart — Restart the bot",
         "/status — Show bot status",
+        "/switch — Switch between configured assistant profiles",
+        "/ram — Switch to Ram",
+        "/rem — Switch to Rem",
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",
@@ -336,6 +392,10 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
+    router.exact("/switch", cmd_switch)
+    router.prefix("/switch ", cmd_switch)
+    router.exact("/ram", cmd_switch_ram)
+    router.exact("/rem", cmd_switch_rem)
     router.exact("/dream", cmd_dream)
     router.exact("/dream-log", cmd_dream_log)
     router.prefix("/dream-log ", cmd_dream_log)

@@ -100,7 +100,26 @@ class WebSearchTool(Tool):
     def read_only(self) -> bool:
         return True
 
+    @property
+    def exclusive(self) -> bool:
+        # Web search often depends on slow external providers. Run one search at a time
+        # so a model-generated burst of parallel queries does not stall the whole turn.
+        return True
+
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
+        # Apply a single wall-clock timeout to the whole search tool call. Some providers
+        # have their own request timeouts, but this outer guard prevents the turn from
+        # hanging if a provider or dependency never returns cleanly.
+        timeout_s = max(int(self.config.timeout or 30), 1)
+        try:
+            return await asyncio.wait_for(
+                self._execute_with_provider(query, count=count, **kwargs),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            return f"Error: web_search timed out after {timeout_s} seconds"
+
+    async def _execute_with_provider(self, query: str, count: int | None = None, **kwargs: Any) -> str:
         provider = self.config.provider.strip().lower() or "brave"
         n = min(max(count or self.config.max_results, 1), 10)
 
@@ -122,13 +141,14 @@ class WebSearchTool(Tool):
         if not api_key:
             logger.warning("BRAVE_API_KEY not set, falling back to DuckDuckGo")
             return await self._search_duckduckgo(query, n)
+        timeout_s = max(float(self.config.timeout or 30), 1.0)
         try:
             async with httpx.AsyncClient(proxy=self.proxy) as client:
                 r = await client.get(
                     "https://api.search.brave.com/res/v1/web/search",
                     params={"q": query, "count": n},
                     headers={"Accept": "application/json", "X-Subscription-Token": api_key},
-                    timeout=10.0,
+                    timeout=timeout_s,
                 )
                 r.raise_for_status()
             items = [
@@ -144,13 +164,14 @@ class WebSearchTool(Tool):
         if not api_key:
             logger.warning("TAVILY_API_KEY not set, falling back to DuckDuckGo")
             return await self._search_duckduckgo(query, n)
+        timeout_s = max(float(self.config.timeout or 30), 1.0)
         try:
             async with httpx.AsyncClient(proxy=self.proxy) as client:
                 r = await client.post(
                     "https://api.tavily.com/search",
                     headers={"Authorization": f"Bearer {api_key}"},
                     json={"query": query, "max_results": n},
-                    timeout=15.0,
+                    timeout=timeout_s,
                 )
                 r.raise_for_status()
             return _format_results(query, r.json().get("results", []), n)
@@ -166,13 +187,14 @@ class WebSearchTool(Tool):
         is_valid, error_msg = _validate_url(endpoint)
         if not is_valid:
             return f"Error: invalid SearXNG URL: {error_msg}"
+        timeout_s = max(float(self.config.timeout or 30), 1.0)
         try:
             async with httpx.AsyncClient(proxy=self.proxy) as client:
                 r = await client.get(
                     endpoint,
                     params={"q": query, "format": "json"},
                     headers={"User-Agent": USER_AGENT},
-                    timeout=10.0,
+                    timeout=timeout_s,
                 )
                 r.raise_for_status()
             return _format_results(query, r.json().get("results", []), n)
@@ -184,6 +206,7 @@ class WebSearchTool(Tool):
         if not api_key:
             logger.warning("JINA_API_KEY not set, falling back to DuckDuckGo")
             return await self._search_duckduckgo(query, n)
+        timeout_s = max(float(self.config.timeout or 30), 1.0)
         try:
             headers = {"Accept": "application/json", "Authorization": f"Bearer {api_key}"}
             encoded_query = quote(query, safe="")
@@ -191,7 +214,7 @@ class WebSearchTool(Tool):
                 r = await client.get(
                     f"https://s.jina.ai/{encoded_query}",
                     headers=headers,
-                    timeout=15.0,
+                    timeout=timeout_s,
                 )
                 r.raise_for_status()
             data = r.json().get("data", [])[:n]

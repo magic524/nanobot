@@ -28,11 +28,15 @@ class MessageTool(Tool):
         default_channel: str = "",
         default_chat_id: str = "",
         default_message_id: str | None = None,
+        block_same_chat_text_reply: bool = False,
     ):
         self._send_callback = send_callback
         self._default_channel = default_channel
         self._default_chat_id = default_chat_id
         self._default_message_id = default_message_id
+        # 仅对当前聊天、纯文本、无附件的 message() 调用做硬拦截。
+        # 这样可以避免本地模型把普通回复误走成工具发送。
+        self._block_same_chat_text_reply = block_same_chat_text_reply
         self._sent_in_turn: bool = False
 
     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
@@ -92,6 +96,15 @@ class MessageTool(Tool):
         if not self._send_callback:
             return "Error: Message sending not configured"
 
+        same_target = channel == self._default_channel and chat_id == self._default_chat_id
+        # 当前聊天里“普通纯文本回复”应该直接作为 assistant 文本返回，
+        # 不应该绕一圈走 message() 工具。这里只在显式开启时拦截。
+        if self._block_same_chat_text_reply and same_target and not media:
+            return (
+                "Error: same-chat plain-text replies are blocked for this profile. "
+                "Reply with normal assistant text instead."
+            )
+
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
@@ -104,7 +117,7 @@ class MessageTool(Tool):
 
         try:
             await self._send_callback(msg)
-            if channel == self._default_channel and chat_id == self._default_chat_id:
+            if same_target:
                 self._sent_in_turn = True
             media_info = f" with {len(media)} attachments" if media else ""
             return f"Message sent to {channel}:{chat_id}{media_info}"
