@@ -31,6 +31,7 @@ class ContextBuilder:
         self,
         skill_names: list[str] | None = None,
         channel: str | None = None,
+        session_metadata: dict[str, Any] | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity(channel=channel)]
@@ -59,6 +60,10 @@ class ContextBuilder:
             parts.append("# Recent History\n\n" + "\n".join(
                 f"- [{e['timestamp']}] {e['content']}" for e in capped
             ))
+
+        web_mode = self._build_web_mode_section(session_metadata or {})
+        if web_mode:
+            parts.append(web_mode)
 
         return "\n\n---\n\n".join(parts)
 
@@ -112,6 +117,38 @@ class ContextBuilder:
 
         return "\n\n".join(parts) if parts else ""
 
+    @staticmethod
+    def _build_web_mode_section(session_metadata: dict[str, Any]) -> str:
+        """Inject browser-first operating guidance for sessions that enable max web mode."""
+        if not session_metadata.get("max_web_permission_mode"):
+            return ""
+
+        return """# Web Agent Mode
+
+The user has enabled "maximum web permission" for this session. For webpage and web app tasks, you should actively use the browser automation framework instead of stopping at high-level guidance.
+
+When a task involves interacting with a website, prefer this workflow:
+1. Inspect or select the right tab with `browser_cdp_tabs` or `browser_tabs`.
+2. Open the target page with `browser_open` if needed.
+3. Read page state with `browser_eval`, `browser_snapshot`, or `browser_element_probe`.
+4. Re-locate the exact target element on the current page immediately before any page-specific action, preferably with `browser_find_action_target` for controls like buttons, tabs, likes, favorites, or submit actions.
+5. Perform the smallest necessary action with `browser_click`, `browser_click_point`, or `browser_type`.
+6. Verify the result with `browser_eval`, `browser_element_probe`, or `browser_screenshot`.
+
+After search, navigation, popup, or any action that may open a new tab, you must refresh tab selection again before continuing.
+Do not assume the original tab remains the target tab after search results or website redirects.
+Do not reuse element coordinates, selector assumptions, or button positions from a previous page, previous tab, or earlier step after navigation.
+For any action such as clicking a like button, submit button, search result, or video card:
+- first confirm the active target tab,
+- then probe the target element again on that exact page,
+- then execute the action,
+- then verify the result.
+If the target page was opened in a new tab, prefer closing that tab when the task says to return, instead of blindly using `history.back()`.
+
+Use this framework as the default second choice whenever plain reasoning is not enough to complete a webpage task.
+Do not claim browser tasks are impossible until you have checked whether the browser tools can handle them.
+Keep actions scoped to the user's stated goal and report findings succinctly."""
+
     def build_messages(
         self,
         history: list[dict[str, Any]],
@@ -121,6 +158,7 @@ class ContextBuilder:
         channel: str | None = None,
         chat_id: str | None = None,
         current_role: str = "user",
+        session_metadata: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
@@ -133,7 +171,14 @@ class ContextBuilder:
         else:
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
         messages = [
-            {"role": "system", "content": self.build_system_prompt(skill_names, channel=channel)},
+            {
+                "role": "system",
+                "content": self.build_system_prompt(
+                    skill_names,
+                    channel=channel,
+                    session_metadata=session_metadata,
+                ),
+            },
             *history,
         ]
         if messages[-1].get("role") == current_role:

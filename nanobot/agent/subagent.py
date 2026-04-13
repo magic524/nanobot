@@ -12,14 +12,29 @@ from nanobot.agent.hook import AgentHook, AgentHookContext
 from nanobot.utils.prompt_templates import render_template
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
+from nanobot.agent.tools.browser import (
+    BrowserClickTool,
+    BrowserClickPointTool,
+    BrowserEvalTool,
+    BrowserFindActionTargetTool,
+    BrowserNetworkTool,
+    BrowserOpenTool,
+    BrowserScreenshotTool,
+    BrowserSnapshotTool,
+    BrowserTabsTool,
+    BrowserTypeTool,
+    BrowserCDPTabsTool,
+    BrowserElementProbeTool
+)
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.browser.service import BrowserService
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.config.schema import ExecToolConfig, WebToolsConfig
+from nanobot.config.schema import BrowserToolConfig, ExecToolConfig, WebToolsConfig
 from nanobot.providers.base import LLMProvider
 
 
@@ -50,16 +65,18 @@ class SubagentManager:
         max_tool_result_chars: int,
         model: str | None = None,
         web_config: "WebToolsConfig | None" = None,
+        browser_config: "BrowserToolConfig | None" = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
     ):
-        from nanobot.config.schema import ExecToolConfig
+        from nanobot.config.schema import BrowserToolConfig, ExecToolConfig
 
         self.provider = provider
         self.workspace = workspace
         self.bus = bus
         self.model = model or provider.get_default_model()
         self.web_config = web_config or WebToolsConfig()
+        self.browser_config = browser_config or BrowserToolConfig()
         self.max_tool_result_chars = max_tool_result_chars
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
@@ -131,6 +148,23 @@ class SubagentManager:
             if self.web_config.enable:
                 tools.register(WebSearchTool(config=self.web_config.search, proxy=self.web_config.proxy))
                 tools.register(WebFetchTool(proxy=self.web_config.proxy))
+            if self.browser_config.enable:
+                browser_service = BrowserService(self.browser_config)
+                for tool in (
+                    BrowserOpenTool(browser_service, str(self.workspace)),
+                    BrowserTabsTool(browser_service, str(self.workspace)),
+                    BrowserCDPTabsTool(browser_service, str(self.workspace)),
+                    BrowserSnapshotTool(browser_service, str(self.workspace)),
+                    BrowserEvalTool(browser_service, str(self.workspace)),
+                    BrowserElementProbeTool(browser_service, str(self.workspace)),
+                    BrowserFindActionTargetTool(browser_service, str(self.workspace)),
+                    BrowserClickTool(browser_service, str(self.workspace)),
+                    BrowserClickPointTool(browser_service, str(self.workspace)),
+                    BrowserTypeTool(browser_service, str(self.workspace)),
+                    BrowserScreenshotTool(browser_service, str(self.workspace)),
+                    BrowserNetworkTool(browser_service, str(self.workspace)),
+                ):
+                    tools.register(tool)
             system_prompt = self._build_subagent_prompt()
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},

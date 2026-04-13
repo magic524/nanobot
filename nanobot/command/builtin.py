@@ -366,6 +366,87 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+def _set_web_power(session, enabled: bool) -> None:
+    """Toggle browser-first web mode for the current session."""
+    key = getattr(session, "metadata", {})
+    if enabled:
+        key["max_web_permission_mode"] = True
+    else:
+        key.pop("max_web_permission_mode", None)
+
+
+async def cmd_web_power(ctx: CommandContext) -> OutboundMessage:
+    """Manage browser-first web agent mode for the current session."""
+    session = ctx.session or ctx.loop.sessions.get_or_create(ctx.key)
+    raw = ctx.raw.strip()
+    suffix = raw[len("/web_power"):].strip()
+
+    normalized = suffix.lower()
+    if suffix in ("开启", "打开", "启用") or normalized in ("on", "enable", "enabled"):
+        _set_web_power(session, True)
+        ctx.loop.sessions.save(session)
+        content = "已开启当前会话的最大网页权限模式。后续网页任务会优先走 browser/CDP 框架。"
+    elif suffix in ("关闭", "取消", "禁用") or normalized in ("off", "disable", "disabled"):
+        _set_web_power(session, False)
+        ctx.loop.sessions.save(session)
+        content = "已关闭当前会话的最大网页权限模式。"
+    elif suffix in ("状态", "status", "") or normalized == "status":
+        enabled = bool(session.metadata.get("max_web_permission_mode"))
+        content = (
+            "当前会话的最大网页权限模式：已开启。"
+            if enabled
+            else "当前会话的最大网页权限模式：未开启。"
+        )
+    else:
+        content = (
+            "用法：\n"
+            "- `/web_power开启`：开启当前会话的最大网页权限模式\n"
+            "- `/web_power关闭`：关闭当前会话的最大网页权限模式\n"
+            "- `/web_power状态`：查看当前状态"
+        )
+
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
+def build_features_text() -> str:
+    """Build a concise feature/mode summary for end users."""
+    lines = [
+        "🐈 nanobot features:",
+        "/help — 显示内置命令列表",
+        "/features — 显示常用功能入口和简短说明",
+        "/status — 查看当前模型、上下文与运行状态",
+        "/switch — 切换已配置的人格/实例形态",
+        "/ram — 切到 Ram",
+        "/rem — 切到 Rem",
+        "/web_power开启 — 开启当前会话的网页代理模式（优先用 browser/CDP 工具）",
+        "/web_power关闭 — 关闭当前会话的网页代理模式",
+        "/web_power状态 — 查看网页代理模式状态",
+        "/dream — 手动触发 Dream 记忆整理",
+        "/dream-log — 查看最近一次 Dream 改了什么",
+        "/dream-restore — 回滚 Dream 记忆版本",
+        "",
+        "网页代理模式说明：",
+        "- 开启后，网页任务会优先尝试 browser_open / browser_eval / browser_element_probe / browser_click 等工具",
+        "- 适合页面读取、元素定位、表单输入、点击与截图校验",
+    ]
+    return "\n".join(lines)
+
+
+async def cmd_features(ctx: CommandContext) -> OutboundMessage:
+    """Return a concise feature list."""
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=build_features_text(),
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
 def build_help_text() -> str:
     """Build canonical help text shared across channels."""
     lines = [
@@ -377,6 +458,10 @@ def build_help_text() -> str:
         "/switch — Switch between configured assistant profiles",
         "/ram — Switch to Ram",
         "/rem — Switch to Rem",
+        "/web_power开启 — Enable browser-first web mode for this session",
+        "/web_power关闭 — Disable browser-first web mode for this session",
+        "/web_power状态 — Show browser-first web mode status",
+        "/features — Show feature entrypoints and brief descriptions",
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",
@@ -396,6 +481,11 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.prefix("/switch ", cmd_switch)
     router.exact("/ram", cmd_switch_ram)
     router.exact("/rem", cmd_switch_rem)
+    router.prefix("/web_power", cmd_web_power)
+    router.exact("/features", cmd_features)
+    router.exact("/feature", cmd_features)
+    router.exact("/feayure", cmd_features)
+    router.exact("/feayures", cmd_features)
     router.exact("/dream", cmd_dream)
     router.exact("/dream-log", cmd_dream_log)
     router.prefix("/dream-log ", cmd_dream_log)

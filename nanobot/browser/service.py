@@ -1,0 +1,620 @@
+"""Playwright-backed managed browser service."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import json
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+import websockets
+from loguru import logger
+
+from nanobot.browser.config import BrowserToolConfig
+
+
+class BrowserServiceError(RuntimeError):
+    """Raised when browser operations fail."""
+
+
+@dataclass
+class NetworkEvent:
+    method: str
+    url: str
+    resource_type: str
+
+
+class BrowserService:
+    """Lazy singleton-like browser manager for tools."""
+
+    def __init__(self, config: BrowserToolConfig):
+        self.config = config
+        self._lock = asyncio.Lock()
+        self._playwright = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._hooked_pages: set[int] = set()
+        self._network_events: deque[NetworkEvent] = deque(maxlen=config.max_network_events)
+        self._cdp_auto_launch_attempted = False
+
+    async def ensure_ready(self):
+        if self._page is not None:
+            return self._page
+        async with self._lock:
+            if self._page is not None:
+                return self._page
+            try:
+                from playwright.async_api import async_playwright
+            except ImportError as exc:
+                raise BrowserServiceError(
+                    "Playwright is not installed. Run: pip install playwright && playwright install chromium"
+                ) from exc
+
+            self._playwright = await async_playwright().start()
+            if self.config.cdp_url:
+                await self._connect_over_cdp()
+            else:
+                await self._launch_managed_browser()
+            logger.info(
+                "Browser service started (headless={}, cdp={})",
+                self.config.headless,
+                bool(self.config.cdp_url),
+            )
+            return self._page
+
+    async def _launch_managed_browser(self) -> None:
+        launch_kwargs: dict[str, Any] = {
+            "headless": self.config.headless,
+            "args": ["--disable-dev-shm-usage", "--no-default-browser-check", "--no-sandbox"],
+            "timeout": self.config.launch_timeout_s * 1000,
+        }
+        if self.config.executable_path:
+            launch_kwargs["executable_path"] = str(Path(self.config.executable_path).expanduser())
+        elif self.config.browser_channel:
+            launch_kwargs["channel"] = self.config.browser_channel
+
+        profile_dir = Path(self.config.user_data_dir).expanduser()
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        self._context = await self._playwright.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
+            locale=self.config.locale,
+            viewport={"width": self.config.viewport_width, "height": self.config.viewport_height},
+            **launch_kwargs,
+        )
+        self._browser = self._context.browser
+        self._install_context_hooks(self._context)
+        self._page = await self._pick_page()
+
+    async def _connect_over_cdp(self) -> None:
+        endpoint = str(self.config.cdp_url or "").strip()
+        if not endpoint:
+            raise BrowserServiceError("cdp_url is empty")
+        try:
+            self._browser = await self._playwright.chromium.connect_over_cdp(
+                endpoint_url=endpoint,
+                timeout=self.config.launch_timeout_s * 1000,
+            )
+        except Exception as exc:
+            launched = await self._maybe_auto_launch_cdp_browser()
+            if launched:
+                try:
+                    self._browser = await self._playwright.chromium.connect_over_cdp(
+                        endpoint_url=endpoint,
+                        timeout=self.config.launch_timeout_s * 1000,
+                    )
+                except Exception as retry_exc:
+                    raise BrowserServiceError(f"connect_over_cdp failed after auto-launch: {retry_exc}") from retry_exc
+            else:
+                raise BrowserServiceError(f"connect_over_cdp failed: {exc}") from exc
+
+        contexts = list(self._browser.contexts)
+        if not contexts:
+            raise BrowserServiceError("CDP browser has no accessible contexts")
+        self._context = contexts[0]
+        self._install_context_hooks(self._context)
+        self._page = await self._pick_page()
+
+    async def _maybe_auto_launch_cdp_browser(self) -> bool:
+        """Best-effort helper: auto-start a CDP browser once, then retry attach."""
+        command = str(self.config.cdp_auto_launch_command or "").strip()
+        if not command or self._cdp_auto_launch_attempted:
+            return False
+
+        self._cdp_auto_launch_attempted = True
+        cwd = None
+        if self.config.cdp_auto_launch_cwd:
+            cwd = str(Path(self.config.cdp_auto_launch_cwd).expanduser())
+
+        try:
+            # 这里故意不等待子进程结束：GUI 浏览器应当在后台持续存活。
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                cwd=cwd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            logger.info("Auto-launching CDP browser with command: {}", command)
+            with contextlib.suppress(ProcessLookupError):
+                if proc.returncode is not None and proc.returncode != 0:
+                    logger.warning("CDP auto-launch command exited immediately with code {}", proc.returncode)
+            await asyncio.sleep(max(int(self.config.cdp_auto_launch_delay_s), 1))
+            return True
+        except Exception as exc:
+            logger.warning("Failed to auto-launch CDP browser: {}", exc)
+            return False
+
+    async def _pick_page(self):
+        if self._context is None:
+            raise BrowserServiceError("browser context not initialized")
+        pages = list(self._context.pages)
+        preferred = [p for p in pages if p.url and p.url not in ("about:blank", "chrome://newtab/")]
+        if preferred:
+            return preferred[-1]
+        if pages:
+            return pages[-1]
+        return await self._context.new_page()
+    
+    async def cdp_tabs(self) -> list[dict[str, Any]]:
+        endpoint = str(self.config.cdp_url or "").rstrip("/")
+        if not endpoint:
+            raise BrowserServiceError("cdp_url is not configured")
+
+        timeout = max(float(getattr(self.config, "cdp_http_timeout_s", 5)), 1.0)
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            r = await client.get(f"{endpoint}/json/list")
+            r.raise_for_status()
+
+        tabs = r.json()
+        return [
+            {
+                "id": t.get("id"),
+                "title": t.get("title"),
+                "url": t.get("url"),
+                "type": t.get("type"),
+                "ws": t.get("webSocketDebuggerUrl"),
+            }
+            for t in tabs
+            if t.get("type") == "page"
+        ]
+
+    async def element_probe(
+        self,
+        selector: str | None = None,
+        text_hint: str | None = None,
+        page_url_contains: str | None = None,
+    ):
+        script = f"""(() => {{
+          const sel = {selector!r};
+          const hint = {text_hint!r};
+          let el = null;
+          if (sel) el = document.querySelector(sel);
+          if (!el && hint) {{
+            el = [...document.querySelectorAll('*')].find(x => (x.innerText || '').includes(hint));
+          }}
+          if (!el) return {{found:false}};
+          const r = el.getBoundingClientRect();
+          return {{
+            found: true,
+            tag: el.tagName,
+            text: (el.innerText || '').trim().slice(0, 300),
+            html: el.outerHTML.slice(0, 500),
+            rect: {{x:r.x, y:r.y, width:r.width, height:r.height}},
+            visible: r.width > 0 && r.height > 0
+          }};
+        }})()"""
+        return await self.evaluate(script, page_url_contains=page_url_contains)
+
+    async def find_action_target(
+        self,
+        text_hint: str,
+        page_url_contains: str | None = None,
+    ) -> dict[str, Any]:
+        """Locate an actionable UI target on the current page and return a click point.
+
+        The returned click point is intentionally biased toward the left icon/hot area
+        instead of the full container center, which is more reliable for controls like
+        bilibili's like/favorite/coin buttons.
+        """
+        script = f"""(() => {{
+          const hint = {text_hint!r};
+          const walker = [...document.querySelectorAll('[title],[aria-label],button,[role="button"],a,div,span')];
+          const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+          const candidates = [];
+
+          for (const el of walker) {{
+            const text = norm(el.innerText);
+            const title = norm(el.getAttribute('title'));
+            const aria = norm(el.getAttribute('aria-label'));
+            const all = `${{text}} ${{title}} ${{aria}}`;
+            if (!all.includes(hint)) continue;
+
+            const r = el.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) continue;
+
+            const clickX = r.x + Math.min(20, Math.max(8, r.width * 0.25));
+            const clickY = r.y + (r.height / 2);
+            candidates.push({{
+              tag: el.tagName,
+              text: text.slice(0, 200),
+              title,
+              ariaLabel: aria,
+              className: String(el.className || '').slice(0, 160),
+              rect: {{ x: r.x, y: r.y, width: r.width, height: r.height }},
+              clickPoint: {{ x: clickX, y: clickY }},
+              visible: true,
+            }});
+          }}
+
+          const preferred = candidates.find(c => c.title.includes(hint) || c.ariaLabel.includes(hint));
+          if (preferred) return {{ found: true, ...preferred }};
+          if (candidates.length) return {{ found: true, ...candidates[0] }};
+          return {{ found: false, textHint: hint }};
+        }})()"""
+        result = await self.evaluate(script, page_url_contains=page_url_contains)
+        if not isinstance(result, dict):
+            raise BrowserServiceError("find_action_target failed: invalid result")
+        return result
+
+        
+
+    def _install_context_hooks(self, context) -> None:
+        for page in context.pages:
+            self._install_network_hooks(page)
+        context.on("page", self._install_network_hooks)
+
+    def _install_network_hooks(self, page) -> None:
+        if not self.config.network_capture:
+            return
+        page_id = id(page)
+        if page_id in self._hooked_pages:
+            return
+        self._hooked_pages.add(page_id)
+
+        def _record(request):
+            try:
+                self._network_events.append(
+                    NetworkEvent(
+                        method=request.method,
+                        url=request.url,
+                        resource_type=request.resource_type,
+                    )
+                )
+            except Exception:
+                logger.debug("Failed to record network event", exc_info=True)
+
+        page.on("request", _record)
+
+    @staticmethod
+    def _is_loopback_http(url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return False
+        host = (parsed.hostname or "").lower()
+        return host in {"127.0.0.1", "localhost", "::1"}
+
+    async def _cdp_page_ws(self, page_url_contains: str | None = None) -> str:
+        endpoint = str(self.config.cdp_url or "").strip().rstrip("/")
+        if endpoint.startswith("ws://") or endpoint.startswith("wss://"):
+            return endpoint
+
+        list_url = f"{endpoint}/json/list"
+        timeout = max(float(self.config.timeout_s), 1.0)
+        trust_env = not self._is_loopback_http(endpoint)
+        try:
+            async with httpx.AsyncClient(timeout=timeout, trust_env=trust_env) as client:
+                response = await client.get(list_url)
+                response.raise_for_status()
+            tabs = response.json()
+        except Exception as exc:
+            raise BrowserServiceError(f"CDP tab discovery failed: {exc}") from exc
+
+        page_tabs = [tab for tab in tabs if tab.get("type") == "page" and tab.get("webSocketDebuggerUrl")]
+        if not page_tabs:
+            raise BrowserServiceError("CDP endpoint returned no page targets")
+
+        chosen = None
+        if page_url_contains:
+            chosen = next((tab for tab in page_tabs if page_url_contains in str(tab.get("url", ""))), None)
+        if chosen is None:
+            preferred = [tab for tab in page_tabs if str(tab.get("url", "")) not in ("about:blank", "chrome://newtab/")]
+            # 在 CDP 模式下，self._page 很容易落后于真实激活 tab。
+            # 这里优先取 /json/list 中排序靠前的非空页面，避免操作后仍错误命中旧 tab。
+            chosen = preferred[0] if preferred else page_tabs[0]
+
+        return str(chosen.get("webSocketDebuggerUrl", ""))
+
+    async def _cdp_send(self, method: str, params: dict[str, Any] | None = None, *, page_url_contains: str | None = None) -> Any:
+        ws_url = await self._cdp_page_ws(page_url_contains=page_url_contains)
+        timeout = max(float(self.config.timeout_s), 1.0)
+        try:
+            async with websockets.connect(ws_url, open_timeout=timeout, close_timeout=timeout) as ws:
+                message_id = 0
+
+                async def _send_once(name: str, payload: dict[str, Any] | None = None) -> Any:
+                    nonlocal message_id
+                    message_id += 1
+                    await ws.send(json.dumps({"id": message_id, "method": name, "params": payload or {}}))
+                    while True:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                        msg = json.loads(raw)
+                        if msg.get("id") != message_id:
+                            continue
+                        if msg.get("error"):
+                            raise BrowserServiceError(f"CDP {name} failed: {msg['error']}")
+                        return msg.get("result", {})
+
+                await _send_once("Page.enable")
+                await _send_once("Runtime.enable")
+                return await _send_once(method, params)
+        except BrowserServiceError:
+            raise
+        except Exception as exc:
+            raise BrowserServiceError(f"CDP {method} failed: {exc}") from exc
+
+    async def navigate(
+        self,
+        url: str,
+        wait_until: str = "domcontentloaded",
+        page_url_contains: str | None = None,
+    ) -> dict[str, Any]:
+        page = await self.ensure_ready()
+        if self.config.cdp_url:
+            try:
+                await self._cdp_send("Page.navigate", {"url": url}, page_url_contains=page_url_contains)
+                await asyncio.sleep(1.0)
+                result = await self.evaluate(
+                    """(() => ({
+                        title: document.title,
+                        url: location.href
+                    }))()""",
+                    await_promise=True,
+                    page_url_contains=page_url_contains,
+                )
+                if not isinstance(result, dict):
+                    raise BrowserServiceError("navigate failed: invalid CDP navigation result")
+                return {
+                    "url": result.get("url") or url,
+                    "title": result.get("title") or "",
+                    "status": None,
+                }
+            except Exception as exc:
+                raise BrowserServiceError(f"navigate failed: {exc}") from exc
+        try:
+            response = await page.goto(url, wait_until=wait_until, timeout=self.config.timeout_s * 1000)
+            title = await page.title()
+            return {
+                "url": page.url,
+                "title": title,
+                "status": getattr(response, "status", None),
+            }
+        except Exception as exc:
+            raise BrowserServiceError(f"navigate failed: {exc}") from exc
+
+    async def snapshot(self, max_chars: int | None = None) -> dict[str, Any]:
+        page = await self.ensure_ready()
+        limit = max_chars or self.config.max_snapshot_chars
+        if self.config.cdp_url:
+            try:
+                result = await self.evaluate(
+                    """(() => ({
+                        title: document.title,
+                        url: location.href,
+                        text: (document.body?.innerText || "")
+                    }))()""",
+                    await_promise=True,
+                )
+                if not isinstance(result, dict):
+                    raise BrowserServiceError("snapshot failed: invalid CDP result")
+                text = str(result.get("text") or "")
+                return {
+                    "url": result.get("url") or "",
+                    "title": result.get("title") or "",
+                    "text": text[:limit],
+                    "truncated": len(text) > limit,
+                }
+            except Exception as exc:
+                raise BrowserServiceError(f"snapshot failed: {exc}") from exc
+        try:
+            title = await page.title()
+            text = await page.locator("body").inner_text(timeout=self.config.timeout_s * 1000)
+            return {
+                "url": page.url,
+                "title": title,
+                "text": text[:limit],
+                "truncated": len(text) > limit,
+            }
+        except Exception as exc:
+            raise BrowserServiceError(f"snapshot failed: {exc}") from exc
+
+    async def evaluate(self, script: str, await_promise: bool = True, page_url_contains: str | None = None) -> Any:
+        page = await self.ensure_ready()
+        if self.config.cdp_url:
+            result = await self._cdp_send(
+                "Runtime.evaluate",
+                {
+                    "expression": script,
+                    "awaitPromise": await_promise,
+                    "returnByValue": True,
+                },
+                page_url_contains=page_url_contains,
+            )
+            return (result.get("result") or {}).get("value")
+        try:
+            return await page.evaluate(script)
+        except Exception as exc:
+            raise BrowserServiceError(f"evaluate failed: {exc}") from exc
+
+    async def click(self, selector: str, page_url_contains: str | None = None) -> str:
+        page = await self.ensure_ready()
+        if self.config.cdp_url:
+            try:
+                probe = await self.evaluate(
+                    f"""(() => {{
+                        const el = document.querySelector({selector!r});
+                        if (!el) return {{found:false}};
+                        const r = el.getBoundingClientRect();
+                        return {{
+                            found: true,
+                            x: r.x + r.width / 2,
+                            y: r.y + r.height / 2,
+                            visible: r.width > 0 && r.height > 0
+                        }};
+                    }})()""",
+                    await_promise=True,
+                    page_url_contains=page_url_contains,
+                )
+                if not isinstance(probe, dict) or not probe.get("found"):
+                    raise BrowserServiceError(f"click failed: selector not found: {selector}")
+                if not probe.get("visible"):
+                    raise BrowserServiceError(f"click failed: selector not visible: {selector}")
+                await self.click_point(
+                    int(round(float(probe["x"]))),
+                    int(round(float(probe["y"]))),
+                    page_url_contains=page_url_contains,
+                )
+                return f"Clicked: {selector}"
+            except Exception as exc:
+                raise BrowserServiceError(f"click failed: {exc}") from exc
+        try:
+            await page.locator(selector).first.click(timeout=self.config.timeout_s * 1000)
+            return f"Clicked: {selector}"
+        except Exception as exc:
+            raise BrowserServiceError(f"click failed: {exc}") from exc
+
+    async def click_point(self, x: int, y: int, page_url_contains: str | None = None) -> dict[str, Any]:
+        await self.ensure_ready()
+        if self.config.cdp_url:
+            await self._cdp_send(
+                "Input.dispatchMouseEvent",
+                {"type": "mouseMoved", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 0},
+                page_url_contains=page_url_contains,
+            )
+            await self._cdp_send(
+                "Input.dispatchMouseEvent",
+                {"type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1},
+                page_url_contains=page_url_contains,
+            )
+            await self._cdp_send(
+                "Input.dispatchMouseEvent",
+                {"type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1},
+                page_url_contains=page_url_contains,
+            )
+            return {"ok": True, "x": x, "y": y, "backend": "cdp"}
+        page = await self.ensure_ready()
+        try:
+            await page.mouse.click(x, y)
+            return {"ok": True, "x": x, "y": y, "backend": "playwright"}
+        except Exception as exc:
+            raise BrowserServiceError(f"click_point failed: {exc}") from exc
+
+    async def type_text(
+        self,
+        selector: str,
+        text: str,
+        press_enter: bool = False,
+        page_url_contains: str | None = None,
+    ) -> str:
+        page = await self.ensure_ready()
+        if self.config.cdp_url:
+            try:
+                focused = await self.evaluate(
+                    f"""(() => {{
+                        const el = document.querySelector({selector!r});
+                        if (!el) return {{found:false}};
+                        el.focus();
+                        if ('value' in el) {{
+                            el.value = {text!r};
+                            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        }}
+                        return {{found:true}};
+                    }})()""",
+                    await_promise=True,
+                    page_url_contains=page_url_contains,
+                )
+                if not isinstance(focused, dict) or not focused.get("found"):
+                    raise BrowserServiceError(f"type failed: selector not found: {selector}")
+                if press_enter:
+                    await self._cdp_send(
+                        "Input.dispatchKeyEvent",
+                        {"type": "keyDown", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13},
+                        page_url_contains=page_url_contains,
+                    )
+                    await self._cdp_send(
+                        "Input.dispatchKeyEvent",
+                        {"type": "keyUp", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13},
+                        page_url_contains=page_url_contains,
+                    )
+                return f"Typed into {selector}"
+            except Exception as exc:
+                raise BrowserServiceError(f"type failed: {exc}") from exc
+        try:
+            locator = page.locator(selector).first
+            await locator.click(timeout=self.config.timeout_s * 1000)
+            await locator.fill(text, timeout=self.config.timeout_s * 1000)
+            if press_enter:
+                await locator.press("Enter")
+            return f"Typed into {selector}"
+        except Exception as exc:
+            raise BrowserServiceError(f"type failed: {exc}") from exc
+
+    async def screenshot(
+        self,
+        output_path: str,
+        full_page: bool = True,
+        page_url_contains: str | None = None,
+    ) -> str:
+        page = await self.ensure_ready()
+        out = Path(output_path).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if self.config.cdp_url:
+            try:
+                result = await self._cdp_send(
+                    "Page.captureScreenshot",
+                    {"format": "png", "captureBeyondViewport": bool(full_page)},
+                    page_url_contains=page_url_contains,
+                )
+                raw = result.get("data")
+                if not raw:
+                    raise BrowserServiceError("screenshot failed: no image data returned")
+                out.write_bytes(base64.b64decode(raw))
+                return str(out)
+            except Exception as exc:
+                raise BrowserServiceError(f"screenshot failed: {exc}") from exc
+        try:
+            await page.screenshot(path=str(out), full_page=full_page)
+            return str(out)
+        except Exception as exc:
+            raise BrowserServiceError(f"screenshot failed: {exc}") from exc
+
+    async def list_tabs(self) -> list[dict[str, Any]]:
+        await self.ensure_ready()
+        if self.config.cdp_url:
+            tabs = await self.cdp_tabs()
+            return [
+                {
+                    "index": idx,
+                    "url": tab.get("url", ""),
+                    "title": tab.get("title", ""),
+                }
+                for idx, tab in enumerate(tabs)
+            ]
+        if self._context is None:
+            return []
+        tabs = []
+        for idx, p in enumerate(self._context.pages):
+            tabs.append({"index": idx, "url": p.url, "title": await p.title()})
+        return tabs
+
+    async def recent_network(self) -> list[dict[str, str]]:
+        await self.ensure_ready()
+        return [event.__dict__ for event in list(self._network_events)]

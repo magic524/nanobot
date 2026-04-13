@@ -18,6 +18,21 @@ from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import Consolidator, Dream
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.browser import (
+    BrowserClickTool,
+    BrowserClickPointTool,
+    BrowserEvalTool,
+    BrowserFindActionTargetTool,
+    BrowserNetworkTool,
+    BrowserOpenTool,
+    BrowserScreenshotTool,
+    BrowserSnapshotTool,
+    BrowserTabsTool,
+    BrowserTypeTool,
+    BrowserCDPTabsTool,
+    BrowserElementProbeTool,
+
+)
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -27,6 +42,7 @@ from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.browser.service import BrowserService
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.bus.queue import MessageBus
@@ -37,7 +53,7 @@ from nanobot.utils.helpers import image_placeholder_text, truncate_text
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebToolsConfig
+    from nanobot.config.schema import BrowserToolConfig, ChannelsConfig, ExecToolConfig, WebToolsConfig
     from nanobot.cron.service import CronService
 
 
@@ -113,6 +129,10 @@ class _LoopHook(AgentHook):
         return self._loop._strip_think(content)
 
 class AgentLoop:
+    _MAX_WEB_MODE_KEY = "max_web_permission_mode"
+    _ENABLE_MAX_WEB_PHRASE = "给你最大网页权限"
+    _DISABLE_MAX_WEB_PHRASES = ("关闭最大网页权限", "取消最大网页权限")
+
     """
     The agent loop is the core processing engine.
 
@@ -138,6 +158,7 @@ class AgentLoop:
         max_tool_result_chars: int | None = None,
         provider_retry_mode: str = "standard",
         web_config: WebToolsConfig | None = None,
+        browser_config: BrowserToolConfig | None = None,
         exec_config: ExecToolConfig | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
@@ -150,7 +171,7 @@ class AgentLoop:
         block_same_chat_text_message_tool: bool = False,
         switch_profiles: dict[str, Any] | None = None,
     ):
-        from nanobot.config.schema import ExecToolConfig, WebToolsConfig
+        from nanobot.config.schema import BrowserToolConfig, ExecToolConfig, WebToolsConfig
 
         defaults = AgentDefaults()
         self.bus = bus
@@ -174,6 +195,7 @@ class AgentLoop:
         )
         self.provider_retry_mode = provider_retry_mode
         self.web_config = web_config or WebToolsConfig()
+        self.browser_config = browser_config or BrowserToolConfig()
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
@@ -191,6 +213,7 @@ class AgentLoop:
             bus=bus,
             model=self.model,
             web_config=self.web_config,
+            browser_config=self.browser_config,
             max_tool_result_chars=self.max_tool_result_chars,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
@@ -279,6 +302,7 @@ class AgentLoop:
         self.max_tool_result_chars = loaded.agents.defaults.max_tool_result_chars
         self.provider_retry_mode = loaded.agents.defaults.provider_retry_mode
         self.web_config = loaded.tools.web
+        self.browser_config = loaded.tools.browser
         self.exec_config = loaded.tools.exec
         self.restrict_to_workspace = loaded.tools.restrict_to_workspace
         self._mcp_servers = loaded.tools.mcp_servers
@@ -294,6 +318,7 @@ class AgentLoop:
             bus=self.bus,
             model=self.model,
             web_config=self.web_config,
+            browser_config=self.browser_config,
             max_tool_result_chars=self.max_tool_result_chars,
             exec_config=self.exec_config,
             restrict_to_workspace=self.restrict_to_workspace,
@@ -348,6 +373,23 @@ class AgentLoop:
         if self.web_config.enable:
             self.tools.register(WebSearchTool(config=self.web_config.search, proxy=self.web_config.proxy))
             self.tools.register(WebFetchTool(proxy=self.web_config.proxy))
+        if self.browser_config.enable:
+            browser_service = BrowserService(self.browser_config)
+            for tool in (
+                BrowserOpenTool(browser_service, str(self.workspace)),
+                BrowserTabsTool(browser_service, str(self.workspace)),
+                BrowserCDPTabsTool(browser_service, str(self.workspace)),
+                BrowserSnapshotTool(browser_service, str(self.workspace)),
+                BrowserEvalTool(browser_service, str(self.workspace)),
+                BrowserElementProbeTool(browser_service, str(self.workspace)),
+                BrowserFindActionTargetTool(browser_service, str(self.workspace)),
+                BrowserClickTool(browser_service, str(self.workspace)),
+                BrowserClickPointTool(browser_service, str(self.workspace)),
+                BrowserTypeTool(browser_service, str(self.workspace)),
+                BrowserScreenshotTool(browser_service, str(self.workspace)),
+                BrowserNetworkTool(browser_service, str(self.workspace)),
+            ):
+                self.tools.register(tool)
         self.tools.register(MessageTool(
             send_callback=self.bus.publish_outbound,
             block_same_chat_text_reply=self._block_same_chat_text_message_tool,
@@ -609,6 +651,7 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
+                session_metadata=session.metadata,
             )
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages, session=session, channel=channel, chat_id=chat_id,
@@ -629,8 +672,26 @@ class AgentLoop:
         if self._restore_runtime_checkpoint(session):
             self.sessions.save(session)
 
-        # Slash commands
         raw = msg.content.strip()
+        current_message = msg.content
+        mode_notice: str | None = None
+
+        if any(phrase in raw for phrase in self._DISABLE_MAX_WEB_PHRASES):
+            session.metadata.pop(self._MAX_WEB_MODE_KEY, None)
+            self.sessions.save(session)
+            mode_notice = "已关闭当前会话的最大网页权限模式。"
+            if raw in self._DISABLE_MAX_WEB_PHRASES:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=mode_notice)
+
+        if self._ENABLE_MAX_WEB_PHRASE in raw:
+            session.metadata[self._MAX_WEB_MODE_KEY] = True
+            self.sessions.save(session)
+            mode_notice = "已开启当前会话的最大网页权限模式。后续网页任务会优先走 browser/CDP 框架。"
+            current_message = current_message.replace(self._ENABLE_MAX_WEB_PHRASE, "").strip()
+            if not current_message:
+                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=mode_notice)
+
+        # Slash commands
         ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
         if result := await self.commands.dispatch(ctx):
             return result
@@ -645,9 +706,10 @@ class AgentLoop:
         history = session.get_history(max_messages=0)
         initial_messages = self.context.build_messages(
             history=history,
-            current_message=msg.content,
+            current_message=current_message,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
+            session_metadata=session.metadata,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -681,6 +743,9 @@ class AgentLoop:
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+
+        if mode_notice:
+            final_content = f"{mode_notice}\n\n{final_content}"
 
         meta = dict(msg.metadata or {})
         if on_stream is not None:
