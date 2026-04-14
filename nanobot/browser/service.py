@@ -30,6 +30,20 @@ class NetworkEvent:
     resource_type: str
 
 
+@dataclass
+class ActionTarget:
+    found: bool
+    text_hint: str
+    tag: str = ""
+    text: str = ""
+    title: str = ""
+    aria_label: str = ""
+    class_name: str = ""
+    rect: dict[str, float] | None = None
+    click_point: dict[str, float] | None = None
+    visible: bool = False
+
+
 class BrowserService:
     """Lazy singleton-like browser manager for tools."""
 
@@ -212,18 +226,15 @@ class BrowserService:
         }})()"""
         return await self.evaluate(script, page_url_contains=page_url_contains)
 
-    async def find_action_target(
-        self,
-        text_hint: str,
-        page_url_contains: str | None = None,
-    ) -> dict[str, Any]:
-        """Locate an actionable UI target on the current page and return a click point.
+    @staticmethod
+    def _build_action_target_script(text_hint: str) -> str:
+        """Return a generic DOM probe script for action-like controls.
 
-        The returned click point is intentionally biased toward the left icon/hot area
-        instead of the full container center, which is more reliable for controls like
-        bilibili's like/favorite/coin buttons.
+        The heuristic intentionally favors semantic attributes (`title`, `aria-label`)
+        and returns a left-biased hotspot instead of the container center. This keeps
+        the browser layer generic while still being more reliable for icon+count UIs.
         """
-        script = f"""(() => {{
+        return f"""(() => {{
           const hint = {text_hint!r};
           const walker = [...document.querySelectorAll('[title],[aria-label],button,[role="button"],a,div,span')];
           const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
@@ -254,14 +265,75 @@ class BrowserService:
           }}
 
           const preferred = candidates.find(c => c.title.includes(hint) || c.ariaLabel.includes(hint));
-          if (preferred) return {{ found: true, ...preferred }};
-          if (candidates.length) return {{ found: true, ...candidates[0] }};
+          if (preferred) return {{ found: true, textHint: hint, ...preferred }};
+          if (candidates.length) return {{ found: true, textHint: hint, ...candidates[0] }};
           return {{ found: false, textHint: hint }};
         }})()"""
+
+    async def find_action_target(
+        self,
+        text_hint: str,
+        page_url_contains: str | None = None,
+    ) -> dict[str, Any]:
+        """Locate an actionable UI target on the current page and return a click point.
+
+        The returned click point is intentionally biased toward the left icon/hot area
+        instead of the full container center, which is more reliable for controls like
+        bilibili's like/favorite/coin buttons.
+        """
+        script = self._build_action_target_script(text_hint)
         result = await self.evaluate(script, page_url_contains=page_url_contains)
         if not isinstance(result, dict):
             raise BrowserServiceError("find_action_target failed: invalid result")
-        return result
+        target = ActionTarget(
+            found=bool(result.get("found")),
+            text_hint=str(result.get("textHint") or text_hint),
+            tag=str(result.get("tag") or ""),
+            text=str(result.get("text") or ""),
+            title=str(result.get("title") or ""),
+            aria_label=str(result.get("ariaLabel") or ""),
+            class_name=str(result.get("className") or ""),
+            rect=result.get("rect") if isinstance(result.get("rect"), dict) else None,
+            click_point=result.get("clickPoint") if isinstance(result.get("clickPoint"), dict) else None,
+            visible=bool(result.get("visible")),
+        )
+        return {
+            "found": target.found,
+            "textHint": target.text_hint,
+            "tag": target.tag,
+            "text": target.text,
+            "title": target.title,
+            "ariaLabel": target.aria_label,
+            "className": target.class_name,
+            "rect": target.rect,
+            "clickPoint": target.click_point,
+            "visible": target.visible,
+        }
+
+    async def click_action_target(
+        self,
+        text_hint: str,
+        page_url_contains: str | None = None,
+    ) -> dict[str, Any]:
+        """Find an action target on the current page and click its suggested hotspot."""
+        target = await self.find_action_target(text_hint, page_url_contains=page_url_contains)
+        if not target.get("found"):
+            raise BrowserServiceError(f"click_action_target failed: target not found: {text_hint}")
+        click_point = target.get("clickPoint")
+        if not isinstance(click_point, dict):
+            raise BrowserServiceError(f"click_action_target failed: no click point for target: {text_hint}")
+
+        try:
+            x = int(round(float(click_point["x"])))
+            y = int(round(float(click_point["y"])))
+        except Exception as exc:
+            raise BrowserServiceError(f"click_action_target failed: invalid click point: {click_point}") from exc
+
+        click_result = await self.click_point(x, y, page_url_contains=page_url_contains)
+        return {
+            "target": target,
+            "click": click_result,
+        }
 
         
 

@@ -282,6 +282,30 @@ class BrowserFindActionTargetTool(_BrowserTool):
 
 @tool_parameters(
     tool_parameters_schema(
+        text_hint=StringSchema("Action label to locate and click on the current page, e.g. 点赞/收藏/提交"),
+        page_url_contains=StringSchema("Optional substring to pick a matching CDP page/tab"),
+        required=["text_hint"],
+    )
+)
+class BrowserClickActionTargetTool(_BrowserTool):
+    name = "browser_click_action_target"
+    description = "Locate an actionable target on the current page and click its suggested hotspot."
+
+    async def execute(
+        self,
+        text_hint: str,
+        page_url_contains: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        return await self._safe_call(
+            self.service.click_action_target,
+            text_hint,
+            page_url_contains=page_url_contains,
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
         site=StringSchema("Target site name, e.g. douyin/bilibili/xiaohongshu"),
         limit=IntegerSchema(5, description="Maximum number of comments to read", minimum=1, maximum=20),
     )

@@ -13,6 +13,7 @@ from nanobot.utils.prompt_templates import render_template
 from nanobot.agent.runner import AgentRunSpec, AgentRunner
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.browser import (
+    BrowserClickActionTargetTool,
     BrowserClickTool,
     BrowserClickPointTool,
     BrowserEvalTool,
@@ -158,6 +159,7 @@ class SubagentManager:
                     BrowserEvalTool(browser_service, str(self.workspace)),
                     BrowserElementProbeTool(browser_service, str(self.workspace)),
                     BrowserFindActionTargetTool(browser_service, str(self.workspace)),
+                    BrowserClickActionTargetTool(browser_service, str(self.workspace)),
                     BrowserClickTool(browser_service, str(self.workspace)),
                     BrowserClickPointTool(browser_service, str(self.workspace)),
                     BrowserTypeTool(browser_service, str(self.workspace)),
