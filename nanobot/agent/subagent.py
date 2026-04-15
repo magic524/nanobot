@@ -14,16 +14,23 @@ from nanobot.agent.runner import AgentRunSpec, AgentRunner
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.browser import (
     BrowserClickActionTargetTool,
+    BrowserCollectLazyItemsTool,
     BrowserClickTool,
     BrowserClickPointTool,
     BrowserEvalTool,
     BrowserFindActionTargetTool,
+    BrowserInspectScrollTargetsTool,
     BrowserNetworkTool,
     BrowserOpenTool,
+    BrowserPressTool,
+    BrowserScrollIntoViewTool,
+    BrowserScrollTool,
     BrowserScreenshotTool,
     BrowserSnapshotTool,
     BrowserTabsTool,
     BrowserTypeTool,
+    BrowserWaitForTool,
+    BrowserWaitForChangeTool,
     BrowserCDPTabsTool,
     BrowserElementProbeTool
 )
@@ -162,7 +169,14 @@ class SubagentManager:
                     BrowserClickActionTargetTool(browser_service, str(self.workspace)),
                     BrowserClickTool(browser_service, str(self.workspace)),
                     BrowserClickPointTool(browser_service, str(self.workspace)),
+                    BrowserScrollTool(browser_service, str(self.workspace)),
+                    BrowserScrollIntoViewTool(browser_service, str(self.workspace)),
+                    BrowserInspectScrollTargetsTool(browser_service, str(self.workspace)),
+                    BrowserWaitForTool(browser_service, str(self.workspace)),
+                    BrowserWaitForChangeTool(browser_service, str(self.workspace)),
+                    BrowserCollectLazyItemsTool(browser_service, str(self.workspace)),
                     BrowserTypeTool(browser_service, str(self.workspace)),
+                    BrowserPressTool(browser_service, str(self.workspace)),
                     BrowserScreenshotTool(browser_service, str(self.workspace)),
                     BrowserNetworkTool(browser_service, str(self.workspace)),
                 ):

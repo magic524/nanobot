@@ -58,12 +58,47 @@ class BrowserService:
         self._network_events: deque[NetworkEvent] = deque(maxlen=config.max_network_events)
         self._cdp_auto_launch_attempted = False
 
+    def _runtime_alive(self) -> bool:
+        """Best-effort health check for cached browser handles."""
+        try:
+            if self._page is None:
+                return False
+            is_closed = getattr(self._page, "is_closed", None)
+            if callable(is_closed) and is_closed():
+                return False
+            if self._browser is not None:
+                is_connected = getattr(self._browser, "is_connected", None)
+                if callable(is_connected) and not is_connected():
+                    return False
+            if self._context is not None:
+                pages = getattr(self._context, "pages", None)
+                if pages is not None and len(list(pages)) == 0 and not self.config.cdp_url:
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _reset_runtime(self) -> None:
+        """Forget stale Playwright/CDP handles so the next call can reattach/relaunch."""
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._hooked_pages.clear()
+        # 外部关闭 Chrome 后，允许下一轮再次尝试 auto-launch。
+        self._cdp_auto_launch_attempted = False
+
     async def ensure_ready(self):
-        if self._page is not None:
+        if self._page is not None and self._runtime_alive():
             return self._page
+        if self._page is not None and not self._runtime_alive():
+            logger.info("Browser runtime became stale; resetting cached handles")
+            self._reset_runtime()
         async with self._lock:
-            if self._page is not None:
+            if self._page is not None and self._runtime_alive():
                 return self._page
+            if self._page is not None and not self._runtime_alive():
+                logger.info("Browser runtime became stale inside lock; resetting cached handles")
+                self._reset_runtime()
             try:
                 from playwright.async_api import async_playwright
             except ImportError as exc:
@@ -71,7 +106,8 @@ class BrowserService:
                     "Playwright is not installed. Run: pip install playwright && playwright install chromium"
                 ) from exc
 
-            self._playwright = await async_playwright().start()
+            if self._playwright is None:
+                self._playwright = await async_playwright().start()
             if self.config.cdp_url:
                 await self._connect_over_cdp()
             else:
@@ -199,6 +235,46 @@ class BrowserService:
             if t.get("type") == "page"
         ]
 
+    @staticmethod
+    def _dom_helpers_script() -> str:
+        return """
+          const __nb_allRoots = () => {
+            const roots = [];
+            const seen = new Set();
+            const queue = [document];
+            while (queue.length) {
+              const root = queue.shift();
+              if (!root || seen.has(root)) continue;
+              seen.add(root);
+              roots.push(root);
+              const nodes = root.querySelectorAll ? root.querySelectorAll('*') : [];
+              for (const el of nodes) {
+                if (el && el.shadowRoot && !seen.has(el.shadowRoot)) {
+                  queue.push(el.shadowRoot);
+                }
+              }
+            }
+            return roots;
+          };
+          const __nb_queryAll = (sel) => {
+            if (!sel) return [];
+            const out = [];
+            for (const root of __nb_allRoots()) {
+              try { out.push(...root.querySelectorAll(sel)); } catch {}
+            }
+            return out;
+          };
+          const __nb_findByText = (hint) => {
+            if (!hint) return null;
+            for (const root of __nb_allRoots()) {
+              const nodes = root.querySelectorAll ? [...root.querySelectorAll('*')] : [];
+              const found = nodes.find(x => ((x.innerText || x.textContent || '').includes(hint)));
+              if (found) return found;
+            }
+            return null;
+          };
+        """
+
     async def element_probe(
         self,
         selector: str | None = None,
@@ -206,13 +282,12 @@ class BrowserService:
         page_url_contains: str | None = None,
     ):
         script = f"""(() => {{
+          {self._dom_helpers_script()}
           const sel = {selector!r};
           const hint = {text_hint!r};
           let el = null;
-          if (sel) el = document.querySelector(sel);
-          if (!el && hint) {{
-            el = [...document.querySelectorAll('*')].find(x => (x.innerText || '').includes(hint));
-          }}
+          if (sel) el = __nb_queryAll(sel)[0] || null;
+          if (!el && hint) el = __nb_findByText(hint);
           if (!el) return {{found:false}};
           const r = el.getBoundingClientRect();
           return {{
@@ -335,7 +410,373 @@ class BrowserService:
             "click": click_result,
         }
 
-        
+    async def scroll(
+        self,
+        delta_y: int = 800,
+        selector: str | None = None,
+        page_url_contains: str | None = None,
+    ) -> dict[str, Any]:
+        """Scroll the page or a matching scroll container."""
+        await self.ensure_ready()
+        if self.config.cdp_url:
+            script = f"""(() => {{
+              const sel = {selector!r};
+              const deltaY = {delta_y};
+              let target = null;
+              if (sel) target = document.querySelector(sel);
+              if (target && typeof target.scrollTop === 'number') {{
+                const before = target.scrollTop;
+                target.scrollTop = before + deltaY;
+                target.dispatchEvent(new Event('scroll', {{ bubbles: true }}));
+                return {{
+                  target: 'element',
+                  selector: sel,
+                  before,
+                  after: target.scrollTop,
+                  deltaY,
+                }};
+              }}
+              const before = window.scrollY;
+              window.scrollBy(0, deltaY);
+              return {{
+                target: 'window',
+                before,
+                after: window.scrollY,
+                deltaY,
+              }};
+            }})()"""
+            try:
+                result = await self.evaluate(script, await_promise=True, page_url_contains=page_url_contains)
+                if not isinstance(result, dict):
+                    raise BrowserServiceError("scroll failed: invalid result")
+                return result
+            except Exception as exc:
+                raise BrowserServiceError(f"scroll failed: {exc}") from exc
+
+        page = await self.ensure_ready()
+        try:
+            if selector:
+                locator = page.locator(selector).first
+                before = await locator.evaluate("(el) => el.scrollTop")
+                after = await locator.evaluate(
+                    "(el, dy) => { el.scrollTop += dy; return el.scrollTop; }",
+                    delta_y,
+                )
+                return {"target": "element", "selector": selector, "before": before, "after": after, "deltaY": delta_y}
+            before = await page.evaluate("() => window.scrollY")
+            await page.mouse.wheel(0, delta_y)
+            after = await page.evaluate("() => window.scrollY")
+            return {"target": "window", "before": before, "after": after, "deltaY": delta_y}
+        except Exception as exc:
+            raise BrowserServiceError(f"scroll failed: {exc}") from exc
+
+    async def scroll_into_view(
+        self,
+        selector: str | None = None,
+        text_hint: str | None = None,
+        page_url_contains: str | None = None,
+    ) -> dict[str, Any]:
+        """Scroll an element into view by selector or visible text hint."""
+        if not selector and not text_hint:
+            raise BrowserServiceError("scroll_into_view failed: selector or text_hint is required")
+
+        script = f"""(() => {{
+          {self._dom_helpers_script()}
+          const sel = {selector!r};
+          const hint = {text_hint!r};
+          let el = null;
+          if (sel) el = __nb_queryAll(sel)[0] || null;
+          if (!el && hint) el = __nb_findByText(hint);
+          if (!el) return {{ found: false }};
+          el.scrollIntoView({{ behavior: 'instant', block: 'center', inline: 'nearest' }});
+          const r = el.getBoundingClientRect();
+          return {{
+            found: true,
+            tag: el.tagName,
+            text: (el.innerText || '').trim().slice(0, 200),
+            rect: {{ x: r.x, y: r.y, width: r.width, height: r.height }},
+            visible: r.width > 0 && r.height > 0
+          }};
+        }})()"""
+        try:
+            result = await self.evaluate(script, await_promise=True, page_url_contains=page_url_contains)
+            if not isinstance(result, dict):
+                raise BrowserServiceError("scroll_into_view failed: invalid result")
+            return result
+        except Exception as exc:
+            raise BrowserServiceError(f"scroll_into_view failed: {exc}") from exc
+
+    async def inspect_scroll_targets(
+        self,
+        page_url_contains: str | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Return likely scrollable containers on the current page."""
+        script = f"""(() => {{
+          const maxItems = {int(limit)};
+          const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+          const all = [document.scrollingElement || document.documentElement, ...document.querySelectorAll('*')];
+          const out = [];
+          for (const el of all) {{
+            const isRoot = el === document.scrollingElement || el === document.documentElement || el === document.body;
+            const sh = isRoot ? Math.max(document.body.scrollHeight, document.documentElement.scrollHeight) : el.scrollHeight;
+            const ch = isRoot ? window.innerHeight : el.clientHeight;
+            const sw = isRoot ? Math.max(document.body.scrollWidth, document.documentElement.scrollWidth) : el.scrollWidth;
+            const cw = isRoot ? window.innerWidth : el.clientWidth;
+            const canScrollY = sh - ch > 40;
+            const canScrollX = sw - cw > 40;
+            if (!canScrollY && !canScrollX) continue;
+            const r = isRoot
+              ? {{ x: 0, y: 0, width: window.innerWidth, height: window.innerHeight }}
+              : el.getBoundingClientRect();
+            const selector = isRoot
+              ? 'document.scrollingElement'
+              : (() => {{
+                  if (el.id) return `#${{el.id}}`;
+                  const cls = norm(el.className).split(' ')[0];
+                  if (cls) return `${{el.tagName.toLowerCase()}}.${{cls}}`;
+                  return el.tagName.toLowerCase();
+                }})();
+            out.push({{
+              selector,
+              tag: el.tagName || 'ROOT',
+              text: norm(el.innerText).slice(0, 80),
+              scrollHeight: sh,
+              clientHeight: ch,
+              scrollWidth: sw,
+              clientWidth: cw,
+              rect: r,
+              canScrollY,
+              canScrollX,
+            }});
+          }}
+          out.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+          return out.slice(0, maxItems);
+        }})()"""
+        try:
+            result = await self.evaluate(script, await_promise=True, page_url_contains=page_url_contains)
+            if not isinstance(result, list):
+                raise BrowserServiceError("inspect_scroll_targets failed: invalid result")
+            return result
+        except Exception as exc:
+            raise BrowserServiceError(f"inspect_scroll_targets failed: {exc}") from exc
+
+    async def wait_for(
+        self,
+        selector: str | None = None,
+        text_hint: str | None = None,
+        timeout_ms: int = 5000,
+        poll_ms: int = 250,
+        page_url_contains: str | None = None,
+    ) -> dict[str, Any]:
+        """Wait until a selector or visible text appears on the current page."""
+        if not selector and not text_hint:
+            raise BrowserServiceError("wait_for failed: selector or text_hint is required")
+        timeout_ms = max(int(timeout_ms), 100)
+        poll_ms = max(int(poll_ms), 50)
+        deadline = asyncio.get_event_loop().time() + (timeout_ms / 1000.0)
+
+        script = f"""(() => {{
+          {self._dom_helpers_script()}
+          const sel = {selector!r};
+          const hint = {text_hint!r};
+          let el = null;
+          if (sel) el = __nb_queryAll(sel)[0] || null;
+          if (!el && hint) el = __nb_findByText(hint);
+          if (!el) return {{ found: false }};
+          const r = el.getBoundingClientRect();
+          return {{
+            found: true,
+            tag: el.tagName,
+            text: (el.innerText || '').trim().slice(0, 200),
+            rect: {{ x: r.x, y: r.y, width: r.width, height: r.height }},
+            visible: r.width > 0 && r.height > 0,
+          }};
+        }})()"""
+
+        last_result: dict[str, Any] = {"found": False}
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                result = await self.evaluate(script, await_promise=True, page_url_contains=page_url_contains)
+                if isinstance(result, dict):
+                    last_result = result
+                    if result.get("found"):
+                        return result
+            except Exception:
+                pass
+            await asyncio.sleep(poll_ms / 1000.0)
+
+        return {
+            "found": False,
+            "selector": selector,
+            "textHint": text_hint,
+            "timeoutMs": timeout_ms,
+            "last": last_result,
+        }
+
+    async def wait_for_change(
+        self,
+        selector: str | None = None,
+        metric: str = "count",
+        baseline: str | None = None,
+        timeout_ms: int = 5000,
+        poll_ms: int = 250,
+        page_url_contains: str | None = None,
+    ) -> dict[str, Any]:
+        """Wait until a page metric changes after user-like interaction."""
+        metric = str(metric or "count").strip().lower()
+        timeout_ms = max(int(timeout_ms), 100)
+        poll_ms = max(int(poll_ms), 50)
+        allowed = {"count", "url", "title", "scrolly", "text"}
+        if metric not in allowed:
+            raise BrowserServiceError(f"wait_for_change failed: unsupported metric: {metric}")
+        if metric in {"count", "text"} and not selector:
+            raise BrowserServiceError(f"wait_for_change failed: selector is required for metric {metric}")
+
+        if baseline is None:
+            initial = await self._read_change_metric(
+                selector=selector,
+                metric=metric,
+                page_url_contains=page_url_contains,
+            )
+            baseline = str(initial.get("value", ""))
+
+        deadline = asyncio.get_event_loop().time() + (timeout_ms / 1000.0)
+        last = {"value": baseline}
+        while asyncio.get_event_loop().time() < deadline:
+            current = await self._read_change_metric(
+                selector=selector,
+                metric=metric,
+                page_url_contains=page_url_contains,
+            )
+            last = current
+            if str(current.get("value", "")) != str(baseline):
+                return {
+                    "changed": True,
+                    "metric": metric,
+                    "selector": selector,
+                    "before": baseline,
+                    "after": current.get("value"),
+                }
+            await asyncio.sleep(poll_ms / 1000.0)
+
+        return {
+            "changed": False,
+            "metric": metric,
+            "selector": selector,
+            "before": baseline,
+            "after": last.get("value"),
+            "timeoutMs": timeout_ms,
+        }
+
+    async def _read_change_metric(
+        self,
+        selector: str | None,
+        metric: str,
+        page_url_contains: str | None = None,
+    ) -> dict[str, Any]:
+        script = f"""(() => {{
+          {self._dom_helpers_script()}
+          const sel = {selector!r};
+          const metric = {metric!r};
+          if (metric === 'url') return {{ value: location.href }};
+          if (metric === 'title') return {{ value: document.title }};
+          if (metric === 'scrolly') return {{ value: window.scrollY }};
+          if (metric === 'count') return {{ value: sel ? __nb_queryAll(sel).length : 0 }};
+          if (metric === 'text') {{
+            const nodes = sel ? __nb_queryAll(sel) : [];
+            return {{
+              value: nodes
+                .map(n => (n.textContent || '').replace(/\\s+/g, ' ').trim())
+                .filter(Boolean)
+                .join('\\n')
+            }};
+          }}
+          return {{ value: null }};
+        }})()"""
+        result = await self.evaluate(script, await_promise=True, page_url_contains=page_url_contains)
+        if not isinstance(result, dict):
+            raise BrowserServiceError("wait_for_change failed: invalid metric result")
+        return result
+
+    async def collect_lazy_items(
+        self,
+        selector: str,
+        container_selector: str | None = None,
+        step_y: int = 900,
+        max_steps: int = 8,
+        wait_ms: int = 700,
+        stable_rounds: int = 2,
+        page_url_contains: str | None = None,
+    ) -> dict[str, Any]:
+        """Incrementally scroll and collect items from a lazy-loaded list until growth stops."""
+        selector = str(selector or "").strip()
+        if not selector:
+            raise BrowserServiceError("collect_lazy_items failed: selector is required")
+        max_steps = max(int(max_steps), 1)
+        wait_ms = max(int(wait_ms), 100)
+        stable_rounds = max(int(stable_rounds), 1)
+
+        seen_items: list[str] = []
+        seen_set: set[str] = set()
+        rounds_without_growth = 0
+        snapshots: list[dict[str, Any]] = []
+
+        for step in range(max_steps):
+            current = await self._read_lazy_items(selector=selector, page_url_contains=page_url_contains)
+            visible_items = [str(x) for x in current.get("items", []) if str(x).strip()]
+            before = len(seen_set)
+            for item in visible_items:
+                cleaned = " ".join(item.split())
+                if cleaned and cleaned not in seen_set:
+                    seen_set.add(cleaned)
+                    seen_items.append(cleaned)
+            after = len(seen_set)
+            snapshots.append({"step": step, "visibleCount": len(visible_items), "uniqueCount": after})
+
+            if after == before:
+                rounds_without_growth += 1
+            else:
+                rounds_without_growth = 0
+            if rounds_without_growth >= stable_rounds:
+                break
+
+            await self.scroll(
+                delta_y=step_y,
+                selector=container_selector,
+                page_url_contains=page_url_contains,
+            )
+            await asyncio.sleep(wait_ms / 1000.0)
+
+        final_state = await self._read_lazy_items(selector=selector, page_url_contains=page_url_contains)
+        return {
+            "selector": selector,
+            "containerSelector": container_selector,
+            "uniqueCount": len(seen_set),
+            "visibleCount": final_state.get("count", 0),
+            "items": seen_items,
+            "snapshots": snapshots,
+        }
+
+    async def _read_lazy_items(
+        self,
+        selector: str,
+        page_url_contains: str | None = None,
+    ) -> dict[str, Any]:
+        script = f"""(() => {{
+          {self._dom_helpers_script()}
+          const sel = {selector!r};
+          const nodes = __nb_queryAll(sel);
+          const items = nodes
+            .map(el => (el.textContent || '').replace(/\\s+/g, ' ').trim())
+            .filter(Boolean);
+          return {{ count: nodes.length, items }};
+        }})()"""
+        result = await self.evaluate(script, await_promise=True, page_url_contains=page_url_contains)
+        if not isinstance(result, dict):
+            raise BrowserServiceError("collect_lazy_items failed: invalid result")
+        return result
+
 
     def _install_context_hooks(self, context) -> None:
         for page in context.pages:
@@ -638,6 +1079,58 @@ class BrowserService:
             return f"Typed into {selector}"
         except Exception as exc:
             raise BrowserServiceError(f"type failed: {exc}") from exc
+
+    async def press_key(
+        self,
+        key: str,
+        page_url_contains: str | None = None,
+    ) -> dict[str, Any]:
+        """Press a keyboard key on the current page or focused element."""
+        key = str(key or "").strip()
+        if not key:
+            raise BrowserServiceError("press failed: key is required")
+
+        key_map: dict[str, tuple[str, str, int]] = {
+            "enter": ("Enter", "Enter", 13),
+            "tab": ("Tab", "Tab", 9),
+            "escape": ("Escape", "Escape", 27),
+            "esc": ("Escape", "Escape", 27),
+            "space": (" ", "Space", 32),
+            "arrowdown": ("ArrowDown", "ArrowDown", 40),
+            "arrowup": ("ArrowUp", "ArrowUp", 38),
+            "arrowleft": ("ArrowLeft", "ArrowLeft", 37),
+            "arrowright": ("ArrowRight", "ArrowRight", 39),
+        }
+        mapped = key_map.get(key.lower())
+
+        page = await self.ensure_ready()
+        if self.config.cdp_url:
+            try:
+                if mapped:
+                    key_value, code, vk = mapped
+                elif len(key) == 1:
+                    key_value, code, vk = key, f"Key{key.upper()}", ord(key.upper())
+                else:
+                    key_value, code, vk = key, key, 0
+                await self._cdp_send(
+                    "Input.dispatchKeyEvent",
+                    {"type": "keyDown", "key": key_value, "code": code, "windowsVirtualKeyCode": vk},
+                    page_url_contains=page_url_contains,
+                )
+                await self._cdp_send(
+                    "Input.dispatchKeyEvent",
+                    {"type": "keyUp", "key": key_value, "code": code, "windowsVirtualKeyCode": vk},
+                    page_url_contains=page_url_contains,
+                )
+                return {"ok": True, "key": key_value, "backend": "cdp"}
+            except Exception as exc:
+                raise BrowserServiceError(f"press failed: {exc}") from exc
+        try:
+            playwright_key = mapped[0] if mapped else key
+            await page.keyboard.press(playwright_key)
+            return {"ok": True, "key": playwright_key, "backend": "playwright"}
+        except Exception as exc:
+            raise BrowserServiceError(f"press failed: {exc}") from exc
 
     async def screenshot(
         self,

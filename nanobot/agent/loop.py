@@ -20,16 +20,23 @@ from nanobot.agent.runner import AgentRunSpec, AgentRunner
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.browser import (
     BrowserClickActionTargetTool,
+    BrowserCollectLazyItemsTool,
     BrowserClickTool,
     BrowserClickPointTool,
     BrowserEvalTool,
     BrowserFindActionTargetTool,
+    BrowserInspectScrollTargetsTool,
     BrowserNetworkTool,
     BrowserOpenTool,
+    BrowserPressTool,
+    BrowserScrollIntoViewTool,
+    BrowserScrollTool,
     BrowserScreenshotTool,
     BrowserSnapshotTool,
     BrowserTabsTool,
     BrowserTypeTool,
+    BrowserWaitForTool,
+    BrowserWaitForChangeTool,
     BrowserCDPTabsTool,
     BrowserElementProbeTool,
 
@@ -133,6 +140,7 @@ class AgentLoop:
     _MAX_WEB_MODE_KEY = "max_web_permission_mode"
     _ENABLE_MAX_WEB_PHRASE = "给你最大网页权限"
     _DISABLE_MAX_WEB_PHRASES = ("关闭最大网页权限", "取消最大网页权限")
+    _WEB_RETRY_PHRASES = ("再试", "继续", "继续试", "重试", "重新试", "继续做", "接着试")
 
     """
     The agent loop is the core processing engine.
@@ -387,7 +395,14 @@ class AgentLoop:
                 BrowserClickActionTargetTool(browser_service, str(self.workspace)),
                 BrowserClickTool(browser_service, str(self.workspace)),
                 BrowserClickPointTool(browser_service, str(self.workspace)),
+                BrowserScrollTool(browser_service, str(self.workspace)),
+                BrowserScrollIntoViewTool(browser_service, str(self.workspace)),
+                BrowserInspectScrollTargetsTool(browser_service, str(self.workspace)),
+                BrowserWaitForTool(browser_service, str(self.workspace)),
+                BrowserWaitForChangeTool(browser_service, str(self.workspace)),
+                BrowserCollectLazyItemsTool(browser_service, str(self.workspace)),
                 BrowserTypeTool(browser_service, str(self.workspace)),
+                BrowserPressTool(browser_service, str(self.workspace)),
                 BrowserScreenshotTool(browser_service, str(self.workspace)),
                 BrowserNetworkTool(browser_service, str(self.workspace)),
             ):
@@ -692,6 +707,14 @@ class AgentLoop:
             current_message = current_message.replace(self._ENABLE_MAX_WEB_PHRASE, "").strip()
             if not current_message:
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=mode_notice)
+
+        if session.metadata.get(self._MAX_WEB_MODE_KEY) and raw in self._WEB_RETRY_PHRASES:
+            current_message = (
+                "继续上一轮网页任务并立即实际重试。"
+                "如果当前没有浏览器会话，不要先口头要求用户重开；"
+                "先直接尝试触发 browser/CDP 工具链，让 browser service 自己完成 auto-launch / reconnect。"
+                "只有在真实工具调用后仍失败，才汇报具体错误。"
+            )
 
         # Slash commands
         ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)

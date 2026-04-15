@@ -153,6 +153,192 @@ class BrowserClickPointTool(_BrowserTool):
 
 @tool_parameters(
     tool_parameters_schema(
+        delta_y=IntegerSchema(800, description="Vertical scroll delta in pixels; negative scrolls up", minimum=-20000, maximum=20000),
+        selector=StringSchema("Optional CSS selector for a scrollable container"),
+        page_url_contains=StringSchema("Optional substring to pick a matching CDP page/tab"),
+    )
+)
+class BrowserScrollTool(_BrowserTool):
+    name = "browser_scroll"
+    description = "Scroll the page or a matching scroll container by a vertical delta."
+
+    async def execute(
+        self,
+        delta_y: int = 800,
+        selector: str | None = None,
+        page_url_contains: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        return await self._safe_call(
+            self.service.scroll,
+            delta_y=delta_y,
+            selector=selector,
+            page_url_contains=page_url_contains,
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        selector=StringSchema("Optional CSS selector to scroll into view"),
+        text_hint=StringSchema("Optional visible text hint to locate an element and scroll it into view"),
+        page_url_contains=StringSchema("Optional substring to pick a matching CDP page/tab"),
+    )
+)
+class BrowserScrollIntoViewTool(_BrowserTool):
+    name = "browser_scroll_into_view"
+    description = "Scroll a target element into view by selector or visible text hint."
+
+    async def execute(
+        self,
+        selector: str | None = None,
+        text_hint: str | None = None,
+        page_url_contains: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        return await self._safe_call(
+            self.service.scroll_into_view,
+            selector=selector,
+            text_hint=text_hint,
+            page_url_contains=page_url_contains,
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        limit=IntegerSchema(10, description="Maximum number of scroll targets to return", minimum=1, maximum=50),
+        page_url_contains=StringSchema("Optional substring to pick a matching CDP page/tab"),
+    )
+)
+class BrowserInspectScrollTargetsTool(_BrowserTool):
+    name = "browser_inspect_scroll_targets"
+    description = "Inspect the current page and return likely scrollable containers."
+    read_only = True
+
+    async def execute(
+        self,
+        limit: int = 10,
+        page_url_contains: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        return await self._safe_call(
+            self.service.inspect_scroll_targets,
+            page_url_contains=page_url_contains,
+            limit=limit,
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        selector=StringSchema("Optional CSS selector to wait for"),
+        text_hint=StringSchema("Optional visible text hint to wait for"),
+        timeout_ms=IntegerSchema(5000, description="Maximum wait time in milliseconds", minimum=100, maximum=60000),
+        poll_ms=IntegerSchema(250, description="Polling interval in milliseconds", minimum=50, maximum=5000),
+        page_url_contains=StringSchema("Optional substring to pick a matching CDP page/tab"),
+    )
+)
+class BrowserWaitForTool(_BrowserTool):
+    name = "browser_wait_for"
+    description = "Wait until a selector or visible text appears on the current page."
+    read_only = True
+
+    async def execute(
+        self,
+        selector: str | None = None,
+        text_hint: str | None = None,
+        timeout_ms: int = 5000,
+        poll_ms: int = 250,
+        page_url_contains: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        return await self._safe_call(
+            self.service.wait_for,
+            selector=selector,
+            text_hint=text_hint,
+            timeout_ms=timeout_ms,
+            poll_ms=poll_ms,
+            page_url_contains=page_url_contains,
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        selector=StringSchema("Optional CSS selector for metrics like count/text"),
+        metric={"type": "string", "enum": ["count", "url", "title", "scrollY", "text"], "default": "count"},
+        baseline=StringSchema("Optional baseline string; if omitted, the current value is used"),
+        timeout_ms=IntegerSchema(5000, description="Maximum wait time in milliseconds", minimum=100, maximum=60000),
+        poll_ms=IntegerSchema(250, description="Polling interval in milliseconds", minimum=50, maximum=5000),
+        page_url_contains=StringSchema("Optional substring to pick a matching CDP page/tab"),
+    )
+)
+class BrowserWaitForChangeTool(_BrowserTool):
+    name = "browser_wait_for_change"
+    description = "Wait until a page metric changes, such as URL, title, scroll position, selector count, or selector text."
+    read_only = True
+
+    async def execute(
+        self,
+        selector: str | None = None,
+        metric: str = "count",
+        baseline: str | None = None,
+        timeout_ms: int = 5000,
+        poll_ms: int = 250,
+        page_url_contains: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        metric_name = "scrolly" if str(metric).lower() == "scrolly" else str(metric).lower()
+        return await self._safe_call(
+            self.service.wait_for_change,
+            selector=selector,
+            metric=metric_name,
+            baseline=baseline,
+            timeout_ms=timeout_ms,
+            poll_ms=poll_ms,
+            page_url_contains=page_url_contains,
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        selector=StringSchema("CSS selector for lazily loaded items, e.g. comment items or result cards"),
+        container_selector=StringSchema("Optional selector for the scrollable container"),
+        step_y=IntegerSchema(900, description="Vertical scroll delta per round", minimum=-20000, maximum=20000),
+        max_steps=IntegerSchema(8, description="Maximum number of scroll-and-collect rounds", minimum=1, maximum=50),
+        wait_ms=IntegerSchema(700, description="Wait after each scroll", minimum=100, maximum=10000),
+        stable_rounds=IntegerSchema(2, description="Stop after this many rounds without new unique items", minimum=1, maximum=10),
+        page_url_contains=StringSchema("Optional substring to pick a matching CDP page/tab"),
+        required=["selector"],
+    )
+)
+class BrowserCollectLazyItemsTool(_BrowserTool):
+    name = "browser_collect_lazy_items"
+    description = "Incrementally scroll and collect items from a lazily loaded list until growth stops."
+    read_only = True
+
+    async def execute(
+        self,
+        selector: str,
+        container_selector: str | None = None,
+        step_y: int = 900,
+        max_steps: int = 8,
+        wait_ms: int = 700,
+        stable_rounds: int = 2,
+        page_url_contains: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        return await self._safe_call(
+            self.service.collect_lazy_items,
+            selector=selector,
+            container_selector=container_selector,
+            step_y=step_y,
+            max_steps=max_steps,
+            wait_ms=wait_ms,
+            stable_rounds=stable_rounds,
+            page_url_contains=page_url_contains,
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
         selector=StringSchema("CSS selector to type into"),
         text=StringSchema("Text to enter"),
         press_enter=BooleanSchema(description="Press Enter after typing", default=False),
@@ -177,6 +363,30 @@ class BrowserTypeTool(_BrowserTool):
             selector,
             text,
             press_enter=press_enter,
+            page_url_contains=page_url_contains,
+        )
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        key=StringSchema("Keyboard key to press, e.g. Enter, Tab, Escape, ArrowDown"),
+        page_url_contains=StringSchema("Optional substring to pick a matching CDP page/tab"),
+        required=["key"],
+    )
+)
+class BrowserPressTool(_BrowserTool):
+    name = "browser_press"
+    description = "Press a keyboard key on the current page or focused element."
+
+    async def execute(
+        self,
+        key: str,
+        page_url_contains: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        return await self._safe_call(
+            self.service.press_key,
+            key,
             page_url_contains=page_url_contains,
         )
 

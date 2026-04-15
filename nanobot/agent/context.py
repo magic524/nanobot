@@ -132,9 +132,13 @@ When a task involves interacting with a website, prefer this workflow:
 2. Open the target page with `browser_open` if needed.
 3. Read page state with `browser_eval`, `browser_snapshot`, or `browser_element_probe`.
 4. Re-locate the exact target element on the current page immediately before any page-specific action, preferably with `browser_find_action_target` for controls like buttons, tabs, likes, favorites, or submit actions.
-5. If the goal is "find and trigger a labeled control on the current page", prefer `browser_click_action_target` instead of manually reusing stale coordinates.
-6. Otherwise perform the smallest necessary action with `browser_click`, `browser_click_point`, or `browser_type`.
-7. Verify the result with `browser_eval`, `browser_element_probe`, or `browser_screenshot`.
+5. If needed, inspect likely scrollable containers with `browser_inspect_scroll_targets`.
+6. Bring off-screen or lazy-loaded content into view with `browser_scroll` or `browser_scroll_into_view` before concluding that the content is unavailable.
+7. After scrolling or navigation, use `browser_wait_for` to verify that the target content actually appeared.
+8. For lazy-loaded feeds, comments, or result lists, use `browser_wait_for_change` and `browser_collect_lazy_items` to confirm that scrolling actually produced new content instead of assuming it did.
+9. If the goal is "find and trigger a labeled control on the current page", prefer `browser_click_action_target` instead of manually reusing stale coordinates.
+10. Otherwise perform the smallest necessary action with `browser_click`, `browser_click_point`, `browser_type`, or `browser_press`.
+11. Verify the result with `browser_eval`, `browser_element_probe`, or `browser_screenshot`.
 
 After search, navigation, popup, or any action that may open a new tab, you must refresh tab selection again before continuing.
 Do not assume the original tab remains the target tab after search results or website redirects.
@@ -144,10 +148,23 @@ For any action such as clicking a like button, submit button, search result, or 
 - then probe the target element again on that exact page,
 - then execute the action,
 - then verify the result.
+Typing into a field does not finish a search or form interaction by itself. If the task implies submit/search/go/login and the page did not change yet, submit it explicitly by clicking a labeled submit/search control or pressing Enter with `browser_press`, then verify that the page or results changed.
+If the user gives an exact URL or a stable resource identifier that can be mapped to a canonical page URL, opening that page directly is often more reliable than homepage search UI.
+If the same interaction pattern fails twice in a row, do not keep repeating it. Change strategy. Examples:
+- if homepage search input did not navigate, switch to a direct search results URL or a canonical resource URL;
+- if plain DOM selectors return empty on a modern web app, inspect web components and shadow roots with `browser_eval` instead of retrying the same selector;
+- if scrolling does not reveal new content, inspect likely scroll containers first, then scroll the correct container, then use `browser_wait_for_change` or `browser_collect_lazy_items` to confirm the page actually changed.
+When extracting content from modern web apps, remember that useful data may live in:
+- shadow DOM trees,
+- web components,
+- page-initialized state objects,
+- lazily mounted sections that only appear after verified scrolling.
 If the target page was opened in a new tab, prefer closing that tab when the task says to return, instead of blindly using `history.back()`.
 
 Use this framework as the default second choice whenever plain reasoning is not enough to complete a webpage task.
 Do not claim browser tasks are impossible until you have checked whether the browser tools can handle them.
+If the user says something short like "再试" or "继续" while the session is already in a webpage task, interpret that as a request to retry the previous webpage workflow, not as a request for a high-level explanation.
+If the browser may be unavailable, first attempt the relevant browser tools so the runtime can auto-launch or reconnect before telling the user to reopen Chrome manually.
 Keep actions scoped to the user's stated goal and report findings succinctly."""
 
     def build_messages(
