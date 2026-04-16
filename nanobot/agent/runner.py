@@ -83,6 +83,8 @@ class AgentRunResult:
 class AgentRunner:
     """Run a tool-capable LLM loop without product-layer concerns."""
 
+    _MCP_DEBUG_PROBE_TOOL = "mcp_notionApi_API-post-search"
+
     def __init__(self, provider: LLMProvider):
         self.provider = provider
 
@@ -348,10 +350,21 @@ class AgentRunner:
         hook: AgentHook,
         context: AgentHookContext,
     ):
+        tool_definitions = spec.tools.get_definitions()
+        tool_names = [self._tool_name(tool) for tool in tool_definitions]
+        logger.info(
+            "LLM request tools for {}: total={}, mcp={}, has_{}={}",
+            spec.session_key or "default",
+            len(tool_names),
+            sum(1 for name in tool_names if name.startswith("mcp_")),
+            self._MCP_DEBUG_PROBE_TOOL,
+            self._MCP_DEBUG_PROBE_TOOL in tool_names,
+        )
+        logger.debug("LLM request tool names for {}: {}", spec.session_key or "default", tool_names)
         kwargs = self._build_request_kwargs(
             spec,
             messages,
-            tools=spec.tools.get_definitions(),
+            tools=tool_definitions,
         )
         if hook.wants_streaming():
             async def _stream(delta: str) -> None:
@@ -384,6 +397,16 @@ class AgentRunner:
             except (TypeError, ValueError):
                 continue
         return result
+
+    @staticmethod
+    def _tool_name(tool: dict[str, Any]) -> str:
+        fn = tool.get("function")
+        if isinstance(fn, dict):
+            name = fn.get("name")
+            if isinstance(name, str):
+                return name
+        name = tool.get("name")
+        return name if isinstance(name, str) else ""
 
     @staticmethod
     def _accumulate_usage(target: dict[str, int], addition: dict[str, int]) -> None:
@@ -720,4 +743,3 @@ class AgentRunner:
         if current:
             batches.append(current)
         return batches
-

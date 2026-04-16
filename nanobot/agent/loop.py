@@ -137,6 +137,8 @@ class _LoopHook(AgentHook):
         return self._loop._strip_think(content)
 
 class AgentLoop:
+    _MCP_DEBUG_PROBE_TOOL = "mcp_notionApi_API-post-search"
+
     _MAX_WEB_MODE_KEY = "max_web_permission_mode"
     _ENABLE_MAX_WEB_PHRASE = "给你最大网页权限"
     _DISABLE_MAX_WEB_PHRASES = ("关闭最大网页权限", "取消最大网页权限")
@@ -318,7 +320,19 @@ class AgentLoop:
         self._unified_session = loaded.agents.defaults.unified_session
         self._block_same_chat_text_message_tool = loaded.agents.defaults.block_same_chat_text_message_tool
 
+        # Profile switches rebuild the tool registry, so existing MCP wrappers become stale.
+        # Force a clean reconnect on the next request so the new profile's MCP tools are re-registered.
+        if self._mcp_stack:
+            try:
+                await self._mcp_stack.aclose()
+            except (RuntimeError, BaseExceptionGroup):
+                pass
+        self._mcp_stack = None
+        self._mcp_connected = False
+        self._mcp_connecting = False
+ 
         self.context = ContextBuilder(self.workspace, timezone=loaded.agents.defaults.timezone)
+
         self.sessions = SessionManager(self.workspace)
         self.runner = AgentRunner(provider)
         self.subagents = SubagentManager(
@@ -354,6 +368,9 @@ class AgentLoop:
         )
         if loaded.agents.defaults.dream.model_override:
             self.dream.model = loaded.agents.defaults.dream.model_override
+        self._log_tool_snapshot(f"profile={target_name} after registry rebuild", include_names=False)
+        await self._connect_mcp()
+        self._log_tool_snapshot(f"profile={target_name} after mcp reconnect")
         self.active_profile_name = target_name
         self._last_usage = {}
         return True, (
@@ -423,11 +440,13 @@ class AgentLoop:
             return
         self._mcp_connecting = True
         from nanobot.agent.tools.mcp import connect_mcp_servers
+        self._log_tool_snapshot("before mcp connect", include_names=False)
         try:
             self._mcp_stack = AsyncExitStack()
             await self._mcp_stack.__aenter__()
             await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
             self._mcp_connected = True
+            self._log_tool_snapshot("after mcp connect")
         except BaseException as e:
             logger.error("Failed to connect MCP servers (will retry next message): {}", e)
             if self._mcp_stack:
@@ -445,6 +464,22 @@ class AgentLoop:
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+
+    def _log_tool_snapshot(self, stage: str, *, include_names: bool = True) -> None:
+        """Emit a compact registry snapshot for profile-switch/MCP debugging."""
+        names = self.tools.tool_names
+        mcp_names = [name for name in names if name.startswith("mcp_")]
+        has_probe = self._MCP_DEBUG_PROBE_TOOL in names
+        logger.info(
+            "Tool snapshot [{}]: total={}, mcp={}, has_{}={}",
+            stage,
+            len(names),
+            len(mcp_names),
+            self._MCP_DEBUG_PROBE_TOOL,
+            has_probe,
+        )
+        if include_names:
+            logger.debug("Tool snapshot names [{}]: {}", stage, names)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -527,8 +562,9 @@ class AgentLoop:
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
-        await self._connect_mcp()
         logger.info("Agent loop started")
+        if self._mcp_servers:
+            asyncio.create_task(self._connect_mcp())
 
         while self._running:
             try:
@@ -629,7 +665,9 @@ class AgentLoop:
                 await self._mcp_stack.aclose()
             except (RuntimeError, BaseExceptionGroup):
                 pass  # MCP SDK cancel scope cleanup is noisy but harmless
-            self._mcp_stack = None
+        self._mcp_stack = None
+        self._mcp_connected = False
+        self._mcp_connecting = False
 
     def _schedule_background(self, coro) -> None:
         """Schedule a coroutine as a tracked background task (drained on shutdown)."""
@@ -661,6 +699,7 @@ class AgentLoop:
             if self._restore_runtime_checkpoint(session):
                 self.sessions.save(session)
             await self.consolidator.maybe_consolidate_by_tokens(session)
+            await self._connect_mcp()
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=0)
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
@@ -723,7 +762,12 @@ class AgentLoop:
 
         await self.consolidator.maybe_consolidate_by_tokens(session)
 
+        # A prior /switch may have rebuilt the registry and cleared MCP wrappers.
+        # Reconnect lazily per request so profile switching does not strand MCP tools.
+        await self._connect_mcp()
+
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
