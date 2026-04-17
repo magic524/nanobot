@@ -78,6 +78,7 @@ class AgentDefaults(Base):
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
+    instance_aliases: dict[str, str] = Field(default_factory=dict)  # Optional in-chat shortcuts for `/instance <name>` (e.g. {"ram": "local"})
     session_ttl_minutes: int = Field(
         default=0,
         ge=0,

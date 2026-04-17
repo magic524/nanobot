@@ -163,6 +163,7 @@ class AgentLoop:
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
+        instance_aliases: dict[str, str] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebToolsConfig
 
@@ -213,6 +214,7 @@ class AgentLoop:
         self._unified_session = unified_session
         self._session_ttl_minutes = session_ttl_minutes
         self._disabled_skills = list(disabled_skills or [])
+        self.instance_aliases = {k.strip().lower(): v.strip() for k, v in (instance_aliases or {}).items() if k.strip() and isinstance(v, str) and v.strip()}
         self.active_config_path = get_config_path().expanduser().resolve(strict=False)
         self.active_instance_name = instance_name_from_path(self.active_config_path)
         self._running = False
@@ -309,6 +311,11 @@ class AgentLoop:
         self._unified_session = loaded.agents.defaults.unified_session
         self._session_ttl_minutes = loaded.agents.defaults.session_ttl_minutes
         self._disabled_skills = list(loaded.agents.defaults.disabled_skills)
+        self.instance_aliases = {
+            k.strip().lower(): v.strip()
+            for k, v in loaded.agents.defaults.instance_aliases.items()
+            if k.strip() and isinstance(v, str) and v.strip()
+        }
 
         self.context = ContextBuilder(
             self.workspace,
@@ -396,6 +403,28 @@ class AgentLoop:
             f"- Config: `{target_path}`\n"
             f"- Workspace: `{self.workspace}`\n"
             f"- Model: `{self.model}`"
+        )
+
+    async def maybe_handle_instance_alias_command(
+        self,
+        *,
+        raw: str,
+        channel: str,
+        chat_id: str,
+    ) -> OutboundMessage | None:
+        """Resolve shorthand commands like `/ram` to instance switches."""
+        if not raw.startswith("/") or " " in raw:
+            return None
+        alias = raw[1:].strip().lower()
+        target = self.instance_aliases.get(alias)
+        if not target:
+            return None
+        ok, content = await self.switch_runtime_instance(target)
+        return OutboundMessage(
+            channel=channel,
+            chat_id=chat_id,
+            content=content,
+            metadata={"render_as": "text"},
         )
 
     def _register_default_tools(self) -> None:
@@ -825,6 +854,12 @@ class AgentLoop:
 
         # Slash commands
         raw = msg.content.strip()
+        if alias_result := await self.maybe_handle_instance_alias_command(
+            raw=raw,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+        ):
+            return alias_result
         ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
         if result := await self.commands.dispatch(ctx):
             return result
