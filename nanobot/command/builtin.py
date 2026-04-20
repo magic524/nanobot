@@ -13,6 +13,16 @@ from nanobot.utils.helpers import build_status_content
 from nanobot.utils.restart import set_restart_notice_to_env
 
 
+def _text_reply(ctx: CommandContext, content: str) -> OutboundMessage:
+    """Return a plain-text command response for the current chat."""
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        metadata={"render_as": "text"},
+    )
+
+
 async def cmd_stop(ctx: CommandContext) -> OutboundMessage:
     """Cancel all active tasks and subagents for the session."""
     loop = ctx.loop
@@ -143,6 +153,41 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id, content="Dreaming...",
     )
+
+
+async def cmd_instance(ctx: CommandContext) -> OutboundMessage:
+    """List or switch discovered runtime instances."""
+    loop = ctx.loop
+    args = ctx.args.strip()
+
+    if not args:
+        current = getattr(loop, "active_instance_name", None) or "default"
+        current_path = getattr(loop, "active_config_path", None)
+        lines = [
+            "## Runtime Instances",
+            "",
+            f"- Current: `{current}`",
+        ]
+        if current_path:
+            lines.append(f"- Config: `{current_path}`")
+
+        instances = loop.list_runtime_instances() if hasattr(loop, "list_runtime_instances") else []
+        if not instances:
+            lines.extend([
+                "- Available: none",
+                "",
+                "nanobot discovers instances from config files like `~/.nanobot/config.json` and `~/.nanobot-*/config.json`.",
+            ])
+        else:
+            lines.extend(["- Available:", ""])
+            for instance in instances:
+                marker = " (current)" if instance.name == current else ""
+                lines.append(f"- `{instance.name}`{marker} — `{instance.config_path}`")
+            lines.extend(["", "Use `/instance <name>` to switch."])
+        return _text_reply(ctx, "\n".join(lines))
+
+    _ok, content = await loop.switch_runtime_instance(args)
+    return _text_reply(ctx, content)
 
 
 def _extract_changed_files(diff: str) -> list[str]:
@@ -331,6 +376,7 @@ def build_help_text() -> str:
         "/stop — Stop the current task",
         "/restart — Restart the bot",
         "/status — Show bot status",
+        "/instance — List or switch discovered runtime instances",
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",
@@ -346,6 +392,8 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
+    router.exact("/instance", cmd_instance)
+    router.prefix("/instance ", cmd_instance)
     router.exact("/dream", cmd_dream)
     router.exact("/dream-log", cmd_dream_log)
     router.prefix("/dream-log ", cmd_dream_log)
