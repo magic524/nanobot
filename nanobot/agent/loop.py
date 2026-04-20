@@ -33,6 +33,13 @@ from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
+from nanobot.config.instances import (
+    RuntimeInstance,
+    discover_runtime_instances,
+    find_runtime_instance,
+    instance_name_from_path,
+)
+from nanobot.config.loader import get_config_path
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
@@ -193,23 +200,10 @@ class AgentLoop:
         self._start_time = time.time()
         self._last_usage: dict[str, int] = {}
         self._extra_hooks: list[AgentHook] = hooks or []
-
-        self.context = ContextBuilder(workspace, timezone=timezone, disabled_skills=disabled_skills)
-        self.sessions = session_manager or SessionManager(workspace)
-        self.tools = ToolRegistry()
-        self.runner = AgentRunner(provider)
-        self.subagents = SubagentManager(
-            provider=provider,
-            workspace=workspace,
-            bus=bus,
-            model=self.model,
-            web_config=self.web_config,
-            max_tool_result_chars=self.max_tool_result_chars,
-            exec_config=self.exec_config,
-            restrict_to_workspace=restrict_to_workspace,
-            disabled_skills=disabled_skills,
-        )
         self._unified_session = unified_session
+        self._tools_config = _tc
+        self.active_config_path = get_config_path().expanduser().resolve(strict=False)
+        self.active_instance_name = instance_name_from_path(self.active_config_path)
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stacks: dict[str, AsyncExitStack] = {}
@@ -226,6 +220,87 @@ class AgentLoop:
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
+        )
+        self._install_runtime(
+            provider=provider,
+            workspace=workspace,
+            session_manager=session_manager,
+            timezone=timezone,
+            disabled_skills=disabled_skills,
+            session_ttl_minutes=session_ttl_minutes,
+        )
+        self._runtime_vars: dict[str, Any] = {}
+        self._current_iteration: int = 0
+        self.commands = CommandRouter()
+        register_builtin_commands(self.commands)
+
+    def list_runtime_instances(self) -> list[RuntimeInstance]:
+        """Return discovered runtime instances, sorted with the active one first."""
+        active_path = self.active_config_path.expanduser().resolve(strict=False)
+        instances = discover_runtime_instances()
+        return sorted(
+            instances,
+            key=lambda item: (
+                item.config_path != active_path,
+                item.name.lower(),
+                str(item.config_path),
+            ),
+        )
+
+    def _has_active_work(self) -> bool:
+        """Return whether the loop currently has running tasks or subagents."""
+        current = asyncio.current_task()
+        if any(
+            (task is not current) and (not task.done())
+            for tasks in self._active_tasks.values()
+            for task in tasks
+        ):
+            return True
+        try:
+            return self.subagents.get_running_count() > 0
+        except Exception:
+            return False
+
+    async def _reset_runtime_switch_state(self) -> None:
+        """Drop old MCP connection state before rebuilding runtime."""
+        for _name, stack in self._mcp_stacks.items():
+            try:
+                await stack.aclose()
+            except Exception:
+                pass
+        self._mcp_stacks.clear()
+        self._mcp_connected = False
+        self._mcp_connecting = False
+
+    def _install_runtime(
+        self,
+        provider: LLMProvider,
+        *,
+        workspace: Path,
+        session_manager: SessionManager | None,
+        timezone: str | None,
+        disabled_skills: list[str] | None,
+        session_ttl_minutes: int,
+    ) -> None:
+        """(Re)create runtime-owned helpers after config changes."""
+        self.context = ContextBuilder(
+            workspace,
+            timezone=timezone,
+            disabled_skills=disabled_skills,
+        )
+        self.sessions = session_manager or SessionManager(workspace)
+        self.tools = ToolRegistry()
+        self.runner = AgentRunner(provider)
+        self.subagents = SubagentManager(
+            provider=provider,
+            workspace=workspace,
+            bus=self.bus,
+            model=self.model,
+            web_config=self.web_config,
+            max_tool_result_chars=self.max_tool_result_chars,
+            exec_config=self.exec_config,
+            restrict_to_workspace=self.restrict_to_workspace,
+            disabled_skills=disabled_skills,
         )
         self.consolidator = Consolidator(
             store=self.context.memory,
@@ -248,12 +323,84 @@ class AgentLoop:
             model=self.model,
         )
         self._register_default_tools()
-        if _tc.my.enable:
-            self.tools.register(MyTool(loop=self, modify_allowed=_tc.my.allow_set))
-        self._runtime_vars: dict[str, Any] = {}
-        self._current_iteration: int = 0
-        self.commands = CommandRouter()
-        register_builtin_commands(self.commands)
+        if self._tools_config.my.enable:
+            self.tools.register(MyTool(loop=self, modify_allowed=self._tools_config.my.allow_set))
+        self._last_usage = {}
+
+    def _rebuild_runtime(
+        self,
+        loaded,
+        provider: LLMProvider,
+        *,
+        config_path: Path,
+        instance_name: str,
+    ) -> None:
+        """Apply a newly loaded config to the active runtime."""
+        self.provider = provider
+        self.active_config_path = config_path
+        self.active_instance_name = instance_name
+        self.workspace = loaded.workspace_path
+        self.model = loaded.agents.defaults.model or provider.get_default_model()
+        self.max_iterations = loaded.agents.defaults.max_tool_iterations
+        self.context_window_tokens = loaded.agents.defaults.context_window_tokens
+        self.context_block_limit = loaded.agents.defaults.context_block_limit
+        self.max_tool_result_chars = loaded.agents.defaults.max_tool_result_chars
+        self.provider_retry_mode = loaded.agents.defaults.provider_retry_mode
+        self.web_config = loaded.tools.web
+        self.exec_config = loaded.tools.exec
+        self.restrict_to_workspace = loaded.tools.restrict_to_workspace
+        self._mcp_servers = loaded.tools.mcp_servers
+        self._unified_session = loaded.agents.defaults.unified_session
+        self._tools_config = loaded.tools
+        self._install_runtime(
+            provider=provider,
+            workspace=self.workspace,
+            session_manager=None,
+            timezone=loaded.agents.defaults.timezone,
+            disabled_skills=loaded.agents.defaults.disabled_skills,
+            session_ttl_minutes=loaded.agents.defaults.session_ttl_minutes,
+        )
+
+    async def switch_runtime_instance(self, name: str) -> tuple[bool, str]:
+        """Hot-switch the active runtime to another discovered instance config."""
+        if self._has_active_work():
+            return (
+                False,
+                "Can't switch right now because another task is still running. "
+                "Please wait for it to finish or use `/stop` first.",
+            )
+
+        target = find_runtime_instance(name)
+        if target is None:
+            available = ", ".join(instance.name for instance in self.list_runtime_instances()) or "(none)"
+            return False, f"Unknown instance `{name}`. Available: {available}"
+
+        target_path = target.config_path.expanduser().resolve(strict=False)
+        if target_path == self.active_config_path.expanduser().resolve(strict=False):
+            return True, f"Already using `{target.name}`."
+
+        from nanobot.cli.commands import _make_provider
+        from nanobot.config.loader import load_config, resolve_config_env_vars, set_config_path
+
+        try:
+            loaded = resolve_config_env_vars(load_config(target_path))
+        except Exception as e:
+            return False, f"Failed to load `{target.name}` from `{target_path}`: {e}"
+
+        try:
+            provider = _make_provider(loaded)
+        except Exception as e:
+            return False, f"Failed to initialize `{target.name}`: {e}"
+
+        await self._reset_runtime_switch_state()
+        set_config_path(target_path)
+        self._rebuild_runtime(loaded, provider, config_path=target_path, instance_name=target.name)
+        return True, (
+            f"Switched to `{target.name}`.\n"
+            f"- Config: `{target_path}`\n"
+            f"- Workspace: `{self.workspace}`\n"
+            f"- Model: `{self.model}`"
+        )
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
