@@ -395,6 +395,7 @@ class AgentLoop:
         await self._reset_runtime_switch_state()
         set_config_path(target_path)
         self._rebuild_runtime(loaded, provider, config_path=target_path, instance_name=target.name)
+        await self._connect_mcp()
         return True, (
             f"Switched to `{target.name}`.\n"
             f"- Config: `{target_path}`\n"
